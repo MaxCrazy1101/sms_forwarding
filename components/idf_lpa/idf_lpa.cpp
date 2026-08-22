@@ -222,20 +222,6 @@ public:
     std::vector<uint8_t> value;
 };
 
-class SensitiveByteArrays {
-public:
-    SensitiveByteArrays() = default;
-    SensitiveByteArrays(const SensitiveByteArrays&) = delete;
-    SensitiveByteArrays& operator=(const SensitiveByteArrays&) = delete;
-    ~SensitiveByteArrays()
-    {
-        for (std::vector<uint8_t>& value : values) clear_sensitive_bytes(value);
-        std::vector<std::vector<uint8_t>>().swap(values);
-    }
-
-    std::vector<std::vector<uint8_t>> values;
-};
-
 static bool equal_ascii_ci(const std::string& left, const char* right)
 {
     if (!right || left.size() != strlen(right)) return false;
@@ -698,16 +684,17 @@ static bool base64_decode_bounded(const std::string& text,
     return true;
 }
 
-static bool base64_encode_bytes(const std::vector<uint8_t>& input,
+static bool base64_encode_bytes(const uint8_t* input,
+                                size_t input_size,
                                 std::string& out,
                                 std::string& message)
 {
     out.clear();
-    size_t capacity = ((input.size() + 2U) / 3U) * 4U + 1U;
+    size_t capacity = ((input_size + 2U) / 3U) * 4U + 1U;
     out.assign(capacity, '\0');
     size_t encoded = 0;
     int rc = mbedtls_base64_encode(reinterpret_cast<unsigned char*>(out.data()), out.size(),
-                                   &encoded, input.data(), input.size());
+                                   &encoded, input, input_size);
     if (rc != 0) {
         out.clear();
         message = "ES9+ Base64 编码失败";
@@ -715,6 +702,13 @@ static bool base64_encode_bytes(const std::vector<uint8_t>& input,
     }
     out.resize(encoded);
     return true;
+}
+
+static bool base64_encode_bytes(const std::vector<uint8_t>& input,
+                                std::string& out,
+                                std::string& message)
+{
+    return base64_encode_bytes(input.data(), input.size(), out, message);
 }
 
 static int hex_value(unsigned char ch)
@@ -2700,7 +2694,64 @@ struct ProfileInstallationResultInfo {
     bool installationSucceeded = false;
 };
 
+static bool parse_notification_metadata(const idf_esim_internal::Tlv& metadata,
+                                        bool require_install,
+                                        std::string& address_text,
+                                        uint32_t& sequence_number,
+                                        std::string& message)
+{
+    static constexpr uint8_t TAG_METADATA[] = {0xBF, 0x2F};
+    static constexpr uint8_t TAG_SEQUENCE[] = {0x80};
+    static constexpr uint8_t TAG_OPERATION[] = {0x81};
+    static constexpr uint8_t TAG_ADDRESS[] = {0x0C};
+    if (!idf_esim_internal::tag_is(metadata, TAG_METADATA)) {
+        message = "NotificationMetadata tag 无效";
+        return false;
+    }
+
+    bool duplicate_sequence = false;
+    bool duplicate_operation = false;
+    bool duplicate_address = false;
+    const idf_esim_internal::Tlv* seq = unique_child(
+        metadata, TAG_SEQUENCE, sizeof(TAG_SEQUENCE), duplicate_sequence);
+    const idf_esim_internal::Tlv* operation = unique_child(
+        metadata, TAG_OPERATION, sizeof(TAG_OPERATION), duplicate_operation);
+    const idf_esim_internal::Tlv* address = unique_child(
+        metadata, TAG_ADDRESS, sizeof(TAG_ADDRESS), duplicate_address);
+    if (duplicate_sequence || duplicate_operation || duplicate_address || !seq ||
+        seq->value.empty() || seq->value.size() > 4U || (seq->value.front() & 0x80U) != 0U ||
+        !operation || operation->value.size() != 2U || !address || address->value.empty()) {
+        message = "NotificationMetadata 字段无效";
+        return false;
+    }
+
+    // NotificationEvent 在 v2.x 中只有 install/enable/disable/delete 四个单比特值。
+    const uint16_t operation_value = static_cast<uint16_t>(operation->value[0]) << 8U |
+                                     operation->value[1];
+    if ((operation_value != 0x0780U && operation_value != 0x0640U &&
+         operation_value != 0x0520U && operation_value != 0x0410U) ||
+        (require_install && operation_value != 0x0780U)) {
+        message = "NotificationMetadata operation 无效";
+        return false;
+    }
+
+    address_text.assign(reinterpret_cast<const char*>(address->value.data()),
+                        address->value.size());
+    std::string host_message;
+    if (!is_printable_ascii(address_text) || !valid_smdp_host(address_text, host_message)) {
+        message = "NotificationMetadata 地址无效";
+        return false;
+    }
+    sequence_number = 0;
+    for (uint8_t byte : seq->value) {
+        sequence_number = (sequence_number << 8U) | byte;
+    }
+    return true;
+}
+
 static bool parse_profile_installation_result(const std::vector<uint8_t>& pir,
+                                              size_t offset,
+                                              size_t length,
                                               ProfileInstallationResultInfo& result,
                                               std::string& message)
 {
@@ -2709,14 +2760,17 @@ static bool parse_profile_installation_result(const std::vector<uint8_t>& pir,
     static constexpr uint8_t TAG_METADATA[] = {0xBF, 0x2F};
     static constexpr uint8_t TAG_SMDP_OID[] = {0x06};
     static constexpr uint8_t TAG_TRANSACTION[] = {0x80};
-    static constexpr uint8_t TAG_OPERATION[] = {0x81};
-    static constexpr uint8_t TAG_ADDRESS[] = {0x0C};
-    static constexpr uint8_t TAG_SEQUENCE[] = {0x80};
     static constexpr uint8_t TAG_FINAL_RESULT[] = {0xA2};
     static constexpr uint8_t TAG_SUCCESS[] = {0xA0};
     static constexpr uint8_t TAG_SIGNATURE[] = {0x5F, 0x37};
+    if (offset > pir.size() || length > pir.size() - offset) {
+        message = "ProfileInstallationResult 范围无效";
+        return false;
+    }
+    size_t pos = offset;
+    const size_t end = offset + length;
     idf_esim_internal::Tlv root;
-    if (!idf_esim_internal::parse_tlv(pir, root, message) ||
+    if (!idf_esim_internal::parse_tlv_at(pir, end, pos, root, message) || pos != end ||
         !idf_esim_internal::tag_is(root, TAG_PIR)) {
         message = "ProfileInstallationResult tag 无效";
         return false;
@@ -2750,33 +2804,9 @@ static bool parse_profile_installation_result(const std::vector<uint8_t>& pir,
         return false;
     }
     result.transactionId.value = transaction->value;
-    bool duplicate_sequence = false;
-    bool duplicate_operation = false;
-    bool duplicate_address = false;
-    const idf_esim_internal::Tlv* seq = unique_child(
-        *metadata, TAG_SEQUENCE, sizeof(TAG_SEQUENCE), duplicate_sequence);
-    const idf_esim_internal::Tlv* operation = unique_child(
-        *metadata, TAG_OPERATION, sizeof(TAG_OPERATION), duplicate_operation);
-    const idf_esim_internal::Tlv* address = unique_child(
-        *metadata, TAG_ADDRESS, sizeof(TAG_ADDRESS), duplicate_address);
-    if (duplicate_sequence || duplicate_operation || duplicate_address || !seq ||
-        seq->value.empty() || seq->value.size() > 4U || (seq->value.front() & 0x80U) != 0U ||
-        !operation || operation->value.size() != 2U || operation->value[0] > 7U ||
-        operation->value[1] != 0x80U || !address || address->value.empty()) {
-        message = "ProfileInstallationResult sequence number 无效";
+    if (!parse_notification_metadata(*metadata, true, result.notificationAddress.text,
+                                     result.sequenceNumber, message)) {
         return false;
-    }
-    result.notificationAddress.text.assign(reinterpret_cast<const char*>(address->value.data()),
-                                           address->value.size());
-    std::string host_message;
-    if (!is_printable_ascii(result.notificationAddress.text) ||
-        !valid_smdp_host(result.notificationAddress.text, host_message)) {
-        message = "ProfileInstallationResult notification 地址无效";
-        return false;
-    }
-    result.sequenceNumber = 0;
-    for (uint8_t byte : seq->value) {
-        result.sequenceNumber = (result.sequenceNumber << 8U) | byte;
     }
     static constexpr uint8_t TAG_AID[] = {0x4F};
     static constexpr uint8_t TAG_ERROR[] = {0xA1};
@@ -2834,36 +2864,104 @@ static esp_err_t es9_post_notification(const std::string& host,
     return ESP_OK;
 }
 
-struct PendingInstallationNotification {
-    size_t payloadIndex = 0;
+struct PendingNotification {
+    size_t payloadOffset = 0;
+    size_t payloadLength = 0;
     uint32_t sequenceNumber = 0;
     std::string address;
 };
 
-static esp_err_t recover_pending_installation_notifications(
+static bool parse_pending_notification(const std::vector<uint8_t>& response,
+                                       const idf_esim_internal::TlvSpan& payload,
+                                       PendingNotification& pending,
+                                       std::string& message)
+{
+    static constexpr uint8_t TAG_INSTALLATION_RESULT[] = {0xBF, 0x37};
+    static constexpr uint8_t TAG_OTHER_NOTIFICATION[] = {0x30};
+    static constexpr uint8_t TAG_METADATA[] = {0xBF, 0x2F};
+    if (idf_esim_internal::tag_is(response, payload, TAG_INSTALLATION_RESULT)) {
+        ProfileInstallationResultInfo info;
+        if (!parse_profile_installation_result(
+                response, payload.offset, payload.encoded_length(), info, message)) return false;
+        pending.payloadOffset = payload.offset;
+        pending.payloadLength = payload.encoded_length();
+        pending.sequenceNumber = info.sequenceNumber;
+        pending.address = info.notificationAddress.text;
+        return true;
+    }
+
+    if (!idf_esim_internal::tag_is(response, payload, TAG_OTHER_NOTIFICATION)) {
+        message = "PendingNotification 类型无效";
+        return false;
+    }
+
+    bool duplicate_metadata = false;
+    bool found_metadata = false;
+    idf_esim_internal::TlvSpan metadata_span;
+    size_t pos = payload.valueOffset;
+    const size_t root_end = payload.valueOffset + payload.valueLength;
+    while (pos < root_end) {
+        idf_esim_internal::TlvSpan child;
+        if (!idf_esim_internal::parse_tlv_span(response, root_end, pos, child, message)) {
+            message = "OtherSignedNotification DER 无效";
+            return false;
+        }
+        if (idf_esim_internal::tag_is(response, child, TAG_METADATA)) {
+            if (found_metadata) duplicate_metadata = true;
+            found_metadata = true;
+            metadata_span = child;
+        }
+    }
+
+    if (duplicate_metadata || !found_metadata) {
+        message = "OtherSignedNotification 元数据无效";
+        return false;
+    }
+    pos = metadata_span.offset;
+    const size_t metadata_end = metadata_span.offset + metadata_span.encoded_length();
+    idf_esim_internal::Tlv metadata;
+    if (!idf_esim_internal::parse_tlv_at(response, metadata_end, pos, metadata, message) ||
+        pos != metadata_end ||
+        !parse_notification_metadata(metadata, false, pending.address,
+                                     pending.sequenceNumber, message)) {
+        if (message.empty()) message = "OtherSignedNotification 元数据无效";
+        return false;
+    }
+    pending.payloadOffset = payload.offset;
+    pending.payloadLength = payload.encoded_length();
+    return true;
+}
+
+static esp_err_t recover_pending_notifications(
+    const std::string& current_host,
     bool allow_missing_protocol,
     const LpaDownloadObserver& observer,
     std::string& message)
 {
-    SensitiveByteArrays payloads;
-    esp_err_t err = idf_esim_lpa_retrieve_installation_notifications(payloads.values, message);
-    if (err != ESP_OK || payloads.values.empty()) return err;
+    SensitiveBytes response;
+    size_t list_offset = 0;
+    size_t list_length = 0;
+    esp_err_t err = idf_esim_lpa_retrieve_notifications(
+        response.value, list_offset, list_length, message);
+    if (err != ESP_OK || list_length == 0U) return err;
 
-    std::vector<PendingInstallationNotification> pending;
-    pending.reserve(payloads.values.size());
-    for (size_t i = 0; i < payloads.values.size(); ++i) {
-        ProfileInstallationResultInfo info;
-        if (!parse_profile_installation_result(payloads.values[i], info, message)) {
+    std::vector<PendingNotification> pending;
+    size_t pos = list_offset;
+    const size_t list_end = list_offset + list_length;
+    while (pos < list_end) {
+        idf_esim_internal::TlvSpan payload;
+        if (!idf_esim_internal::parse_tlv_span(
+                response.value, list_end, pos, payload, message)) {
             return ESP_ERR_INVALID_RESPONSE;
         }
-        PendingInstallationNotification notification;
-        notification.payloadIndex = i;
-        notification.sequenceNumber = info.sequenceNumber;
-        notification.address = info.notificationAddress.text;
+        PendingNotification notification;
+        if (!parse_pending_notification(response.value, payload, notification, message)) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
         pending.push_back(std::move(notification));
     }
-    auto notification_less = [](const PendingInstallationNotification& left,
-                                const PendingInstallationNotification& right) {
+    auto notification_less = [](const PendingNotification& left,
+                                const PendingNotification& right) {
         const int address_order = compare_ascii_ci(left.address, right.address);
         return address_order != 0
             ? address_order < 0
@@ -2871,7 +2969,7 @@ static esp_err_t recover_pending_installation_notifications(
     };
     // 卡侧 pending list 很小，原地插入排序比 std::sort 的模板代码和临时小写字符串更省空间。
     for (size_t i = 1; i < pending.size(); ++i) {
-        PendingInstallationNotification current = std::move(pending[i]);
+        PendingNotification current = std::move(pending[i]);
         size_t insert_at = i;
         while (insert_at > 0 && notification_less(current, pending[insert_at - 1U])) {
             pending[insert_at] = std::move(pending[insert_at - 1U]);
@@ -2887,29 +2985,63 @@ static esp_err_t recover_pending_installation_notifications(
         }
     }
 
-    for (const PendingInstallationNotification& notification : pending) {
-        download_phase(observer, "recover_notification", "正在重发待处理 eUICC 通知");
-        SensitiveText notification_b64;
-        if (!base64_encode_bytes(payloads.values[notification.payloadIndex],
-                                 notification_b64.text, message)) {
-            return ESP_ERR_INVALID_SIZE;
+    size_t sent_count = 0;
+    size_t deferred_groups = 0;
+    esp_err_t current_host_error = ESP_OK;
+    std::string current_host_message;
+    size_t group_begin = 0;
+    // 同一 SM-DP+ 必须按序发送；组内一项失败后保留其余通知等待下次恢复。
+    // 不同 SM-DP+ 相互独立，只有当前下载目标组失败才阻止创建新的同组通知。
+    while (group_begin < pending.size()) {
+        size_t group_end = group_begin + 1U;
+        while (group_end < pending.size() &&
+               compare_ascii_ci(pending[group_begin].address, pending[group_end].address) == 0) {
+            ++group_end;
         }
-        SensitiveText request;
-        bool first = true;
-        request.text.push_back('{');
-        append_json_field(request.text, "pendingNotification", notification_b64.text, first);
-        request.text.push_back('}');
-        clear_string(notification_b64.text);
-        err = es9_post_notification(notification.address, allow_missing_protocol,
-                                    request.text, message);
-        clear_string(request.text);
-        if (err != ESP_OK) return err;
 
-        err = idf_esim_lpa_remove_notification(notification.sequenceNumber, message);
-        if (err != ESP_OK) return err;
+        esp_err_t group_error = ESP_OK;
+        for (size_t i = group_begin; i < group_end; ++i) {
+            const PendingNotification& notification = pending[i];
+            download_phase(observer, "recover_notification", "正在重发待处理 eUICC 通知");
+            SensitiveText notification_b64;
+            if (!base64_encode_bytes(response.value.data() + notification.payloadOffset,
+                                     notification.payloadLength,
+                                     notification_b64.text, message)) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+            SensitiveText request;
+            bool first = true;
+            request.text.push_back('{');
+            append_json_field(request.text, "pendingNotification", notification_b64.text, first);
+            request.text.push_back('}');
+            clear_string(notification_b64.text);
+            group_error = es9_post_notification(notification.address, allow_missing_protocol,
+                                                request.text, message);
+            clear_string(request.text);
+            if (group_error != ESP_OK) break;
+
+            group_error = idf_esim_lpa_remove_notification(notification.sequenceNumber, message);
+            if (group_error != ESP_OK) break;
+            ++sent_count;
+        }
+        if (group_error != ESP_OK) {
+            ++deferred_groups;
+            idf_logf("eSIM pending notification group deferred: result=%s",
+                     esp_err_to_name(group_error));
+            if (compare_ascii_ci(pending[group_begin].address, current_host) == 0) {
+                current_host_error = group_error;
+                current_host_message = message;
+            }
+        }
+        group_begin = group_end;
     }
-    idf_logf("eSIM pending notification recovery: count=%u",
-             static_cast<unsigned>(pending.size()));
+    idf_logf("eSIM pending notification recovery: sent=%u deferredGroups=%u",
+             static_cast<unsigned>(sent_count), static_cast<unsigned>(deferred_groups));
+    if (current_host_error != ESP_OK) {
+        message = current_host_message;
+        return current_host_error;
+    }
+    message.clear();
     return ESP_OK;
 }
 
@@ -2956,8 +3088,8 @@ esp_err_t idf_lpa_run_profile_download(const LpaActivationCode& activation_code,
         return failed(ESP_ERR_INVALID_ARG);
     }
     download_phase(observer, "recover_notifications", "正在检查待处理 eUICC 通知");
-    esp_err_t err = recover_pending_installation_notifications(
-        observer.allow_missing_admin_protocol, observer, safe_message);
+    esp_err_t err = recover_pending_notifications(
+        activation_code.smdpHost, observer.allow_missing_admin_protocol, observer, safe_message);
     if (err != ESP_OK) return failed(err);
 
     download_phase(observer, "authentication", "正在完成 SM-DP+ 认证");
@@ -3045,7 +3177,8 @@ esp_err_t idf_lpa_run_profile_download(const LpaActivationCode& activation_code,
     SensitiveBytes pir;
     pir.value = bpp_parser.installation_result();
     ProfileInstallationResultInfo pir_info;
-    if (!parse_profile_installation_result(pir.value, pir_info, safe_message)) {
+    if (!parse_profile_installation_result(
+            pir.value, 0, pir.value.size(), pir_info, safe_message)) {
         return failed(ESP_ERR_INVALID_RESPONSE);
     }
     if (pir_info.transactionId.value != session.transactionId.value) {
