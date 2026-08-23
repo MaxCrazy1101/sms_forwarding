@@ -1937,14 +1937,11 @@ esp_err_t idf_push_heavy_operation_init(void)
 
 void idf_push_heavy_operation_lock(void)
 {
-    configASSERT(s_heavy_operation_mutex);
-    BaseType_t taken = xSemaphoreTake(s_heavy_operation_mutex, portMAX_DELAY);
-    configASSERT(taken == pdTRUE);
+    xSemaphoreTake(s_heavy_operation_mutex, portMAX_DELAY);
 }
 
 void idf_push_heavy_operation_unlock(void)
 {
-    configASSERT(s_heavy_operation_mutex);
     xSemaphoreGive(s_heavy_operation_mutex);
 }
 

@@ -52,10 +52,10 @@ static constexpr UBaseType_t HEAVY_JOB_QUEUE_LENGTH = 4;
 static constexpr uint32_t HEAVY_WORKER_STACK = 8192;
 
 enum class HeavyJobKind : uint8_t {
-    Esim,
-    Ping,
-    KeepAlive,
-    Scheduler,
+    Esim,       // 日志 kind=0
+    Ping,       // 日志 kind=1
+    KeepAlive,  // 日志 kind=2
+    Scheduler,  // 日志 kind=3
 };
 
 struct HeavyJob {
@@ -2299,6 +2299,23 @@ static void cell_job_unlock(void)
     xSemaphoreGive(s_cell_job_mutex);
 }
 
+static void fail_job_start(WebAsyncJob& job, const char* message, bool clear_esim = false)
+{
+    if (!cell_job_lock(portMAX_DELAY)) return;
+    if (clear_esim) {
+        idf_lpa_clear_sensitive(s_esim_confirmation_code);
+        s_esim_confirmation_submitted = false;
+        job.installHost.clear();
+        job.installMatchingIdMasked.clear();
+    }
+    job.running = false;
+    job.queued = false;
+    job.done = true;
+    job.success = false;
+    job.message = message;
+    cell_job_unlock();
+}
+
 // 调用方已把对应 WebAsyncJob 标记为 queued，并保留 arg 所有权直到成功入队。
 // worker 句柄和队列只在 s_cell_job_mutex 下变更，避免“队列刚排空时入队”丢唤醒。
 static bool enqueue_heavy_job(HeavyJobKind kind, uint8_t slot, void* arg)
@@ -2606,8 +2623,6 @@ static bool start_esim_job(uint8_t slot,
     }
     s_esim_job = WebAsyncJob();
     s_esim_job.queued = true;
-    s_esim_job.done = false;
-    s_esim_job.success = false;
     s_esim_job.slot = slot;
     s_esim_job.action = action;
     if (action == "install-start") {
@@ -2624,17 +2639,7 @@ static bool start_esim_job(uint8_t slot,
 
     EsimTaskArg* arg = new (std::nothrow) EsimTaskArg();
     if (!arg) {
-        if (cell_job_lock(portMAX_DELAY)) {
-            idf_lpa_clear_sensitive(s_esim_confirmation_code);
-            s_esim_confirmation_submitted = false;
-            s_esim_job.queued = false;
-            s_esim_job.done = true;
-            s_esim_job.success = false;
-            s_esim_job.installHost.clear();
-            s_esim_job.installMatchingIdMasked.clear();
-            s_esim_job.message = "创建 eSIM 任务失败：内存不足";
-            cell_job_unlock();
-        }
+        fail_job_start(s_esim_job, "创建 eSIM 任务失败：内存不足", true);
         message = "创建 eSIM 任务失败：内存不足";
         return false;
     }
@@ -2646,17 +2651,7 @@ static bool start_esim_job(uint8_t slot,
     arg->activationCode = std::move(activation_code);
     if (!enqueue_heavy_job(HeavyJobKind::Esim, slot, arg)) {
         delete arg;
-        if (cell_job_lock(portMAX_DELAY)) {
-            idf_lpa_clear_sensitive(s_esim_confirmation_code);
-            s_esim_confirmation_submitted = false;
-            s_esim_job.queued = false;
-            s_esim_job.done = true;
-            s_esim_job.success = false;
-            s_esim_job.installHost.clear();
-            s_esim_job.installMatchingIdMasked.clear();
-            s_esim_job.message = "eSIM 重任务队列已满或 worker 创建失败";
-            cell_job_unlock();
-        }
+        fail_job_start(s_esim_job, "eSIM 重任务队列已满或 worker 创建失败", true);
         message = "eSIM 重任务队列已满或 worker 创建失败";
         return false;
     }
@@ -2983,8 +2978,6 @@ static bool start_keepalive_job(const IdfKeepaliveRunView& cfg, const char* queu
     s_keepalive_job = WebAsyncJob();
     s_keepalive_job.slot = cfg.slot;
     s_keepalive_job.queued = true;
-    s_keepalive_job.done = false;
-    s_keepalive_job.success = false;
     std::string queued = queued_message ? queued_message : "";
     std::string note = keepalive_profile_note(cfg);
     if (!note.empty()) queued += "，" + note;
@@ -2993,26 +2986,14 @@ static bool start_keepalive_job(const IdfKeepaliveRunView& cfg, const char* queu
 
     KeepAliveTaskArg* arg = new (std::nothrow) KeepAliveTaskArg();
     if (!arg) {
-        if (cell_job_lock(portMAX_DELAY)) {
-            s_keepalive_job.queued = false;
-            s_keepalive_job.done = true;
-            s_keepalive_job.success = false;
-            s_keepalive_job.message = "创建保号任务失败：内存不足";
-            cell_job_unlock();
-        }
+        fail_job_start(s_keepalive_job, "创建保号任务失败：内存不足");
         message = "创建保号任务失败：内存不足";
         return false;
     }
     arg->config = cfg;
     if (!enqueue_heavy_job(HeavyJobKind::KeepAlive, cfg.slot, arg)) {
         delete arg;
-        if (cell_job_lock(portMAX_DELAY)) {
-            s_keepalive_job.queued = false;
-            s_keepalive_job.done = true;
-            s_keepalive_job.success = false;
-            s_keepalive_job.message = "保号重任务队列已满或 worker 创建失败";
-            cell_job_unlock();
-        }
+        fail_job_start(s_keepalive_job, "保号重任务队列已满或 worker 创建失败");
         message = "保号重任务队列已满或 worker 创建失败";
         return false;
     }
@@ -3218,24 +3199,11 @@ static bool sched_runner(void* arg_raw)
     return ok;
 }
 
-static const char* heavy_job_name(HeavyJobKind kind)
-{
-    switch (kind) {
-        case HeavyJobKind::Esim: return "esim";
-        case HeavyJobKind::Ping: return "ping";
-        case HeavyJobKind::KeepAlive: return "keepalive";
-        case HeavyJobKind::Scheduler: return "scheduler";
-    }
-    return "unknown";
-}
-
 static void heavy_worker_task(void*)
 {
     while (true) {
         HeavyJob job{};
         if (xQueueReceive(s_heavy_job_queue, &job, 0) == pdTRUE) {
-            idf_logf("重任务开始: kind=%s slot=%u", heavy_job_name(job.kind),
-                     static_cast<unsigned>(job.slot));
             idf_push_heavy_operation_lock();
             bool success = false;
             switch (job.kind) {
@@ -3245,8 +3213,9 @@ static void heavy_worker_task(void*)
                 case HeavyJobKind::Scheduler: success = sched_runner(job.arg); break;
             }
             idf_push_heavy_operation_unlock();
-            idf_logf("重任务结束: kind=%s slot=%u result=%s", heavy_job_name(job.kind),
-                     static_cast<unsigned>(job.slot), success ? "success" : "failed");
+            idf_logf("重任务结束: kind=%u slot=%u result=%s",
+                     static_cast<unsigned>(job.kind), static_cast<unsigned>(job.slot),
+                     success ? "success" : "failed");
             continue;
         }
 
@@ -3293,13 +3262,7 @@ static bool start_sched_job(const IdfSchedRunView& cfg, int index, std::string& 
 
     SchedTaskArg* arg = new (std::nothrow) SchedTaskArg();
     if (!arg) {
-        if (cell_job_lock(portMAX_DELAY)) {
-            s_sched_job.queued = false;
-            s_sched_job.done = true;
-            s_sched_job.success = false;
-            s_sched_job.message = "创建定时任务失败：内存不足";
-            cell_job_unlock();
-        }
+        fail_job_start(s_sched_job, "创建定时任务失败：内存不足");
         message = "创建定时任务失败：内存不足";
         return false;
     }
@@ -3307,13 +3270,7 @@ static bool start_sched_job(const IdfSchedRunView& cfg, int index, std::string& 
     arg->index = index;
     if (!enqueue_heavy_job(HeavyJobKind::Scheduler, cfg.task.slot, arg)) {
         delete arg;
-        if (cell_job_lock(portMAX_DELAY)) {
-            s_sched_job.queued = false;
-            s_sched_job.done = true;
-            s_sched_job.success = false;
-            s_sched_job.message = "定时重任务队列已满或 worker 创建失败";
-            cell_job_unlock();
-        }
+        fail_job_start(s_sched_job, "定时重任务队列已满或 worker 创建失败");
         message = "定时重任务队列已满或 worker 创建失败";
         return false;
     }
@@ -3536,7 +3493,6 @@ static esp_err_t handle_ping(httpd_req_t* req)
 
     s_ping_job = WebAsyncJob();
     s_ping_job.slot = slot;
-    s_ping_job.running = false;
     s_ping_job.queued = true;
     s_ping_job.url = url;
     s_ping_job.message = "后台 HTTP payload 下载已排队";
@@ -3544,16 +3500,7 @@ static esp_err_t handle_ping(httpd_req_t* req)
 
     PingTaskArg* arg = new (std::nothrow) PingTaskArg();
     if (!arg) {
-        // 终态必须写进去(portMAX_DELAY)：300ms 拿锁失败就放弃的话,
-        // running 永远为 true，之后所有蜂窝任务被"任务正忙"挡到重启为止
-        if (cell_job_lock(portMAX_DELAY)) {
-            s_ping_job.running = false;
-            s_ping_job.queued = false;
-            s_ping_job.done = true;
-            s_ping_job.success = false;
-            s_ping_job.message = "创建蜂窝HTTP任务失败：内存不足";
-            cell_job_unlock();
-        }
+        fail_job_start(s_ping_job, "创建蜂窝HTTP任务失败：内存不足");
         return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"创建任务失败：内存不足\"}");
     }
     arg->url = url;
@@ -3561,14 +3508,7 @@ static esp_err_t handle_ping(httpd_req_t* req)
     arg->cellular = cellular_http_config(current.dataEnabled, current.apn);
     if (!enqueue_heavy_job(HeavyJobKind::Ping, slot, arg)) {
         delete arg;
-        if (cell_job_lock(portMAX_DELAY)) {
-            s_ping_job.running = false;
-            s_ping_job.queued = false;
-            s_ping_job.done = true;
-            s_ping_job.success = false;
-            s_ping_job.message = "蜂窝 HTTP 重任务队列已满或 worker 创建失败";
-            cell_job_unlock();
-        }
+        fail_job_start(s_ping_job, "蜂窝 HTTP 重任务队列已满或 worker 创建失败");
         return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"蜂窝 HTTP 重任务队列已满或 worker 创建失败\"}");
     }
 
