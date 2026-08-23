@@ -144,6 +144,8 @@ struct ForwardDecision {
 static SemaphoreHandle_t s_mutex = nullptr;
 // worker 唤醒信号：新任务入队即刻开始处理，不等 100ms 空闲轮询
 static SemaphoreHandle_t s_wake_sem = nullptr;
+// 与 idf_web heavy worker 共用，只串行真实网络/APDU 重区，不保护普通队列状态。
+static SemaphoreHandle_t s_heavy_operation_mutex = nullptr;
 static std::array<PushJob, PUSH_QUEUE_MAX> s_push_jobs;
 static std::array<ForwardJob, FWD_QUEUE_MAX> s_forward_jobs;
 static std::array<EmailJob, EMAIL_QUEUE_MAX> s_email_jobs;
@@ -166,11 +168,19 @@ static bool ensure_init()
         s_wake_sem = xSemaphoreCreateBinary();
         if (!s_wake_sem) return false;
     }
+    if (!s_heavy_operation_mutex) {
+        s_heavy_operation_mutex = xSemaphoreCreateMutex();
+        if (!s_heavy_operation_mutex) return false;
+    }
     return true;
 }
 
 static void cleanup_start_resources()
 {
+    if (s_heavy_operation_mutex) {
+        vSemaphoreDelete(s_heavy_operation_mutex);
+        s_heavy_operation_mutex = nullptr;
+    }
     if (s_wake_sem) {
         vSemaphoreDelete(s_wake_sem);
         s_wake_sem = nullptr;
@@ -194,6 +204,15 @@ static void wake_worker()
 {
     if (s_wake_sem) xSemaphoreGive(s_wake_sem);
 }
+
+class HeavyOperationGuard {
+public:
+    HeavyOperationGuard() { idf_push_heavy_operation_lock(); }
+    ~HeavyOperationGuard() { idf_push_heavy_operation_unlock(); }
+
+    HeavyOperationGuard(const HeavyOperationGuard&) = delete;
+    HeavyOperationGuard& operator=(const HeavyOperationGuard&) = delete;
+};
 
 // TLS 发送前的低堆保护：最大可分配块不足时推迟发送（任务留在队列里稍后重试）
 static bool tls_heap_ok()
@@ -680,6 +699,7 @@ static esp_err_t http_request(uint8_t slot, const std::string& url, const char* 
                               const char* content_type, const std::string& body,
                               int& status_code)
 {
+    HeavyOperationGuard heavy_operation;
     if (!idf_wifi_get_status().staConnected) {
         const IdfSimSettingsView sim = idf_config_get_sim_settings_view(slot);
         IdfCellularHttpConfig cfg;
@@ -1148,6 +1168,7 @@ static bool send_smtp_email(const IdfEmailSettingsView& cfg, const std::string& 
         idf_log_line("邮件配置不完整，跳过发送");
         return false;
     }
+    HeavyOperationGuard heavy_operation;
     esp_tls_cfg_t tls_cfg = {};
     tls_cfg.crt_bundle_attach = esp_crt_bundle_attach;
     tls_cfg.timeout_ms = SMTP_TIMEOUT_MS;
@@ -1907,6 +1928,24 @@ esp_err_t idf_push_start(void)
     s_started = true;
     idf_log_line("推送后台 worker 已启动");
     return ESP_OK;
+}
+
+esp_err_t idf_push_heavy_operation_init(void)
+{
+    return ensure_init() ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+void idf_push_heavy_operation_lock(void)
+{
+    configASSERT(s_heavy_operation_mutex);
+    BaseType_t taken = xSemaphoreTake(s_heavy_operation_mutex, portMAX_DELAY);
+    configASSERT(taken == pdTRUE);
+}
+
+void idf_push_heavy_operation_unlock(void)
+{
+    configASSERT(s_heavy_operation_mutex);
+    xSemaphoreGive(s_heavy_operation_mutex);
 }
 
 bool idf_push_enqueue_forward(uint8_t slot, const char* sender, const char* text,

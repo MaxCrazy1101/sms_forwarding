@@ -279,14 +279,14 @@ static uint16_t response_sw(const std::vector<uint8_t>& resp)
 static constexpr bool response_sw_ok(uint16_t sw) { return sw == 0x9000 || (sw >> 8) == 0x91; }
 static_assert(response_sw_ok(0x9000) && response_sw_ok(0x9108) && !response_sw_ok(0x9300));
 
-static esp_err_t declare_terminal_capability(std::string& message)
+static esp_err_t declare_terminal_capability(uint8_t slot, std::string& message)
 {
     static constexpr const char* TERMINAL_CAPABILITY_CMD =
         "AT+CSIM=20,\"80AA000005A903830107\"";
     std::string response;
     // modem 层 API 会把 AT 成功但卡拒绝的 +CSIM 响应作为 ESP_FAIL 返回；
     // 只要存在 +CSIM 数据行，仍交给严格 parser 区分 malformed 与非 9000 SW。
-    esp_err_t err = idf_modem_send_at(0, TERMINAL_CAPABILITY_CMD, 10000, response);
+    esp_err_t err = idf_modem_send_at(slot, TERMINAL_CAPABILITY_CMD, 10000, response);
     bool has_csim_line = response.find("+CSIM:") != std::string::npos;
     if (err != ESP_OK && !has_csim_line) {
         message = "Terminal Capability AT 传输失败: ";
@@ -302,8 +302,8 @@ static esp_err_t declare_terminal_capability(std::string& message)
 
 class EsimApduSession {
 public:
-    explicit EsimApduSession(bool terminal_capability_required = false)
-        : m_terminal_capability_required(terminal_capability_required)
+    explicit EsimApduSession(uint8_t slot, bool terminal_capability_required = false)
+        : m_slot(slot), m_terminal_capability_required(terminal_capability_required)
     {
     }
 
@@ -311,24 +311,24 @@ public:
     {
         if (m_open) return ESP_OK;
         if (m_terminal_capability_required) {
-            esp_err_t capability_err = declare_terminal_capability(message);
+            esp_err_t capability_err = declare_terminal_capability(m_slot, message);
             if (capability_err != ESP_OK) return capability_err;
         }
         std::string cmd = "AT+CCHO=\"";
         cmd += ISDR_AID_HEX;
         cmd += "\"";
         std::string resp;
-        esp_err_t err = idf_modem_send_at(0, cmd, 30000, resp);
+        esp_err_t err = idf_modem_send_at(m_slot, cmd, 30000, resp);
         if (err != ESP_OK || !parse_ccho_channel(resp, m_channel)) {
             // 上次会话异常退出可能残留逻辑通道，先清理 1..3 再重试一次。
             for (int ch = 1; ch <= 3; ++ch) {
                 char cchc[24];
                 snprintf(cchc, sizeof(cchc), "AT+CCHC=%d", ch);
                 std::string ignored;
-                idf_modem_send_at(0, cchc, 3000, ignored);
+                idf_modem_send_at(m_slot, cchc, 3000, ignored);
             }
             resp.clear();
-            err = idf_modem_send_at(0, cmd, 30000, resp);
+            err = idf_modem_send_at(m_slot, cmd, 30000, resp);
         }
         if (err != ESP_OK || !parse_ccho_channel(resp, m_channel)) {
             message = "打开 eUICC 逻辑通道失败";
@@ -353,7 +353,7 @@ public:
             char cchc[24];
             snprintf(cchc, sizeof(cchc), "AT+CCHC=%d", m_channel);
             std::string ignored;
-            idf_modem_send_at(0, cchc, 5000, ignored);
+            idf_modem_send_at(m_slot, cchc, 5000, ignored);
             m_channel = 0;
             return ESP_FAIL;
         }
@@ -367,7 +367,7 @@ public:
         char cmd[32];
         snprintf(cmd, sizeof(cmd), "AT+CCHC=%d", m_channel);
         std::string ignored;
-        idf_modem_send_at(0, cmd, 5000, ignored);
+        idf_modem_send_at(m_slot, cmd, 5000, ignored);
         m_open = false;
         m_channel = 0;
     }
@@ -392,7 +392,7 @@ public:
         cmd += hex;
         cmd += "\"";
         std::string resp;
-        esp_err_t err = idf_modem_send_at(0, cmd, 30000, resp);
+        esp_err_t err = idf_modem_send_at(m_slot, cmd, 30000, resp);
         if (err != ESP_OK) {
             message = "APDU AT 传输失败: ";
             message += esp_err_to_name(err);
@@ -504,6 +504,7 @@ private:
         }
     }
 
+    uint8_t m_slot;
     int m_channel = 0;
     bool m_open = false;
     bool m_terminal_capability_required = false;
@@ -511,28 +512,33 @@ private:
 
 class EsimOperationGuard {
 public:
-    EsimOperationGuard() { idf_modem_begin_esim_operation(0); }
-    ~EsimOperationGuard() { idf_modem_end_esim_operation(0); }
+    explicit EsimOperationGuard(uint8_t slot) : slot_(slot) { idf_modem_begin_esim_operation(slot_); }
+    ~EsimOperationGuard() { idf_modem_end_esim_operation(slot_); }
+
+private:
+    uint8_t slot_;
 };
 
-static esp_err_t invoke_es10_raw(const std::vector<uint8_t>& request,
+static esp_err_t invoke_es10_raw(uint8_t slot,
+                                 const std::vector<uint8_t>& request,
                                  bool terminal_capability_required,
                                  std::vector<uint8_t>& response,
                                  std::string& message)
 {
-    EsimOperationGuard guard;
-    EsimApduSession session(terminal_capability_required);
+    EsimOperationGuard guard(slot);
+    EsimApduSession session(slot, terminal_capability_required);
     esp_err_t err = session.open(message);
     if (err != ESP_OK) return err;
     return session.exchange_store_data(request, response, message);
 }
 
-static esp_err_t invoke_es10c(const std::vector<uint8_t>& request,
+static esp_err_t invoke_es10c(uint8_t slot,
+                              const std::vector<uint8_t>& request,
                               Tlv& response,
                               std::string& message)
 {
     std::vector<uint8_t> raw;
-    esp_err_t err = invoke_es10_raw(request, false, raw, message);
+    esp_err_t err = invoke_es10_raw(slot, request, false, raw, message);
     if (err != ESP_OK) return err;
     if (!parse_tlv(raw, response, message)) return ESP_FAIL;
     return ESP_OK;
@@ -639,33 +645,34 @@ static bool parse_profile_list_response(const Tlv& response,
 }
 
 // EID 是单张 eUICC 的固定标识，读到一次后缓存：省掉每次列表前的一整个 APDU 会话。
-// 调用方由蜂窝任务互斥锁串行化，无并发写。但可插拔 eUICC 热插拔换卡后 EID 会变，
+// 调用方由设备重任务队列串行化，无并发写。但可插拔 eUICC 热插拔换卡后 EID 会变，
 // 模组的卡身份钩子只置原子脏标记(可能在模组任务上下文触发)，真正清缓存在
 // 下次 read_eid(蜂窝任务上下文)执行，与读取方天然串行，无竞争。
-static std::string s_eid_cache;
-static std::atomic<bool> s_eid_cache_stale{false};
+static std::string s_eid_cache[IDF_MODEM_SLOT_COUNT];
+static std::atomic<bool> s_eid_cache_stale[IDF_MODEM_SLOT_COUNT] = {};
 
 static void on_sim_identity_changed(uint8_t slot)
 {
-    // Phase 2 的 eSIM API 仍固定服务 slot 0；slot 1 的实例化在后续阶段接入。
-    if (slot != 0) return;
-    s_eid_cache_stale.store(true, std::memory_order_relaxed);
+    if (!idf_modem_slot_valid(slot)) return;
+    s_eid_cache_stale[slot].store(true, std::memory_order_relaxed);
 }
 
-static esp_err_t read_eid(std::string& eid, std::string& message)
+static esp_err_t read_eid(uint8_t slot, std::string& eid, std::string& message)
 {
     static constexpr uint8_t TAG_EID_RESP[] = {0xBF, 0x3E};
     static constexpr uint8_t TAG_EID[] = {0x5A};
 
-    if (s_eid_cache_stale.exchange(false, std::memory_order_relaxed)) s_eid_cache.clear();
-    if (!s_eid_cache.empty()) {
-        eid = s_eid_cache;
+    if (s_eid_cache_stale[slot].exchange(false, std::memory_order_relaxed)) {
+        s_eid_cache[slot].clear();
+    }
+    if (!s_eid_cache[slot].empty()) {
+        eid = s_eid_cache[slot];
         message = "EID(缓存)";
         return ESP_OK;
     }
 
     Tlv response;
-    esp_err_t err = invoke_es10c(make_get_eid_request(), response, message);
+    esp_err_t err = invoke_es10c(slot, make_get_eid_request(), response, message);
     if (err != ESP_OK) return err;
     if (!tag_is(response, TAG_EID_RESP)) {
         message = "EID 响应 tag 不匹配";
@@ -677,15 +684,17 @@ static esp_err_t read_eid(std::string& eid, std::string& message)
         return ESP_FAIL;
     }
     eid = eid_decode(eid_tlv->value);
-    s_eid_cache = eid;
+    s_eid_cache[slot] = eid;
     message = "EID 读取成功";
     return ESP_OK;
 }
 
-static esp_err_t read_profiles(std::vector<IdfEsimProfile>& profiles, std::string& message)
+static esp_err_t read_profiles(uint8_t slot,
+                               std::vector<IdfEsimProfile>& profiles,
+                               std::string& message)
 {
     Tlv response;
-    esp_err_t err = invoke_es10c(make_profile_list_request(true), response, message);
+    esp_err_t err = invoke_es10c(slot, make_profile_list_request(true), response, message);
     if (err == ESP_OK && parse_profile_list_response(response, profiles, message)) {
         char buf[64];
         snprintf(buf, sizeof(buf), "已读取 %u 个 eSIM Profile", static_cast<unsigned>(profiles.size()));
@@ -696,7 +705,7 @@ static esp_err_t read_profiles(std::vector<IdfEsimProfile>& profiles, std::strin
     // 部分卡对 tag-list 参数较挑剔，退回 BF2D00 再试一次。
     std::string first_error = message;
     response = Tlv();
-    err = invoke_es10c(make_profile_list_request(false), response, message);
+    err = invoke_es10c(slot, make_profile_list_request(false), response, message);
     if (err == ESP_OK && parse_profile_list_response(response, profiles, message)) {
         char buf[96];
         snprintf(buf, sizeof(buf), "已读取 %u 个 eSIM Profile（兼容模式）", static_cast<unsigned>(profiles.size()));
@@ -758,7 +767,8 @@ static bool identifier_from_profile(const IdfEsimProfile& profile,
     return make_direct_identifier(profile.iccid, true, out, message);
 }
 
-static esp_err_t resolve_identifier(const std::string& raw,
+static esp_err_t resolve_identifier(uint8_t slot,
+                                    const std::string& raw,
                                     bool require_iccid,
                                     ProfileIdentifier& out,
                                     std::string& message)
@@ -771,7 +781,7 @@ static esp_err_t resolve_identifier(const std::string& raw,
 
     std::vector<IdfEsimProfile> profiles;
     std::string list_msg;
-    esp_err_t err = read_profiles(profiles, list_msg);
+    esp_err_t err = read_profiles(slot, profiles, list_msg);
     if (err != ESP_OK) {
         message = "无法解析别名/Profile 名称：" + list_msg;
         return err;
@@ -847,14 +857,15 @@ static const char* delete_result_text(int result)
     }
 }
 
-static esp_err_t profile_operation_once(const ProfileIdentifier& identifier,
+static esp_err_t profile_operation_once(uint8_t slot,
+                                        const ProfileIdentifier& identifier,
                                         bool enable,
                                         int& result_code,
                                         std::string& message)
 {
     result_code = -1;
     Tlv response;
-    esp_err_t err = invoke_es10c(make_profile_operation_request(identifier, enable), response, message);
+    esp_err_t err = invoke_es10c(slot, make_profile_operation_request(identifier, enable), response, message);
     if (err != ESP_OK) return err;
 
     const uint8_t expected_enable[] = {0xBF, 0x31};
@@ -879,40 +890,44 @@ static esp_err_t profile_operation_once(const ProfileIdentifier& identifier,
 
 // 等待模组重启(软/硬)完成：重启请求受理时 phase 立即变 powering，重启后完成短信/注册
 // 配置才进入 registering，此时 SIM 已就绪，可重新打开逻辑通道。
-static bool wait_modem_reset_done(uint32_t timeout_ms)
+static bool wait_modem_reset_done(uint8_t slot, uint32_t timeout_ms)
 {
     for (uint32_t waited = 0; waited < timeout_ms; waited += 1000) {
         vTaskDelay(pdMS_TO_TICKS(1000));
-        IdfModemStatus st = idf_modem_get_status(0);
+        IdfModemStatus st = idf_modem_get_status(slot);
         if (st.atReady && st.phase != "powering" && st.phase != "at_ready") return true;
     }
     return false;
 }
 
-static esp_err_t profile_operation(const std::string& raw, bool enable, std::string& message)
+static esp_err_t profile_operation(uint8_t slot,
+                                   const std::string& raw,
+                                   bool enable,
+                                   std::string& message)
 {
     ProfileIdentifier identifier;
-    esp_err_t err = resolve_identifier(raw, false, identifier, message);
+    esp_err_t err = resolve_identifier(slot, raw, false, identifier, message);
     if (err != ESP_OK) return err;
 
     int code = -1;
-    err = profile_operation_once(identifier, enable, code, message);
+    err = profile_operation_once(slot, identifier, enable, code, message);
     if (err != ESP_OK && code == 5) {
         // catBusy：卡内残留主动式会话(多为旧固件 refreshFlag 遗留；模组不断电时
         // 可跨 ESP 重启甚至 OTA 升级存活)。硬重启(断电)彻底清掉卡内会话后重试一次，
         // 免得用户反复点击都停在"卡工具包忙"
-        idf_logf("eSIM 操作遇到 catBusy，硬重启模组复位 UICC 后重试");
-        idf_modem_request_reset(0, true);
-        if (!wait_modem_reset_done(90000)) {
+        idf_logf("slot=%u eSIM 操作遇到 catBusy，硬重启模组复位 UICC 后重试",
+                 static_cast<unsigned>(slot));
+        idf_modem_request_reset(slot, true);
+        if (!wait_modem_reset_done(slot, 90000)) {
             message += "；模组重启超时，请稍后重试";
             return ESP_FAIL;
         }
-        err = profile_operation_once(identifier, enable, code, message);
+        err = profile_operation_once(slot, identifier, enable, code, message);
     }
     if (err != ESP_OK) return err;
     // 启停结果已写入 eUICC，但当前 UICC 会话仍运行旧 Profile：必须复位 UICC(模组
     // 软重启)才真正生效。这一步就是 issue #17 里用户手动"重启+断电"的自动化。
-    idf_modem_request_reset(0, false);
+    idf_modem_request_reset(slot, false);
     message = enable ? "eSIM Profile 已启用，模组重启附着新卡中"
                      : "eSIM Profile 已禁用，模组重启生效中";
     return ESP_OK;
@@ -929,14 +944,14 @@ static std::vector<uint8_t> make_delete_profile_request(const ProfileIdentifier&
     return out;
 }
 
-static esp_err_t delete_profile(const std::string& raw, std::string& message)
+static esp_err_t delete_profile(uint8_t slot, const std::string& raw, std::string& message)
 {
     ProfileIdentifier identifier;
-    esp_err_t err = resolve_identifier(raw, false, identifier, message);
+    esp_err_t err = resolve_identifier(slot, raw, false, identifier, message);
     if (err != ESP_OK) return err;
 
     Tlv response;
-    err = invoke_es10c(make_delete_profile_request(identifier), response, message);
+    err = invoke_es10c(slot, make_delete_profile_request(identifier), response, message);
     if (err != ESP_OK) return err;
 
     static constexpr uint8_t TAG_RESP[] = {0xBF, 0x33};
@@ -974,7 +989,8 @@ static std::vector<uint8_t> make_set_nickname_request(const ProfileIdentifier& i
     return out;
 }
 
-static esp_err_t set_profile_nickname(const std::string& raw,
+static esp_err_t set_profile_nickname(uint8_t slot,
+                                      const std::string& raw,
                                       const std::string& nickname,
                                       std::string& message)
 {
@@ -985,11 +1001,11 @@ static esp_err_t set_profile_nickname(const std::string& raw,
     }
 
     ProfileIdentifier identifier;
-    esp_err_t err = resolve_identifier(raw, true, identifier, message);
+    esp_err_t err = resolve_identifier(slot, raw, true, identifier, message);
     if (err != ESP_OK) return err;
 
     Tlv response;
-    err = invoke_es10c(make_set_nickname_request(identifier, nick), response, message);
+    err = invoke_es10c(slot, make_set_nickname_request(identifier, nick), response, message);
     if (err != ESP_OK) return err;
 
     static constexpr uint8_t TAG_RESP[] = {0xBF, 0x29};
@@ -1033,14 +1049,15 @@ static esp_err_t read_lpa_preflight(EsimApduSession& session,
     return ESP_OK;
 }
 
-static esp_err_t read_lpa_auth_material(std::vector<uint8_t>& euicc_info1,
+static esp_err_t read_lpa_auth_material(uint8_t slot,
+                                        std::vector<uint8_t>& euicc_info1,
                                         std::array<uint8_t, 16>& challenge,
                                         std::string& message)
 {
     euicc_info1.clear();
     challenge.fill(0);
-    EsimOperationGuard guard;
-    EsimApduSession session(true);
+    EsimOperationGuard guard(slot);
+    EsimApduSession session(slot, true);
     esp_err_t err = session.open(message);
     if (err != ESP_OK) return err;
 
@@ -1068,22 +1085,27 @@ void idf_esim_init(void)
     idf_modem_set_sim_identity_hook(on_sim_identity_changed);
 }
 
-esp_err_t idf_esim_get_eid(std::string& eid, std::string& message)
+esp_err_t idf_esim_get_eid(uint8_t slot, std::string& eid, std::string& message)
 {
-    return read_eid(eid, message);
+    if (!idf_modem_slot_valid(slot)) return ESP_ERR_INVALID_ARG;
+    return read_eid(slot, eid, message);
 }
 
-esp_err_t idf_esim_lpa_get_auth_material(std::vector<uint8_t>& euicc_info1,
+esp_err_t idf_esim_lpa_get_auth_material(uint8_t slot,
+                                         std::vector<uint8_t>& euicc_info1,
                                          std::array<uint8_t, 16>& challenge,
                                          std::string& safe_message)
 {
-    return read_lpa_auth_material(euicc_info1, challenge, safe_message);
+    if (!idf_modem_slot_valid(slot)) return ESP_ERR_INVALID_ARG;
+    return read_lpa_auth_material(slot, euicc_info1, challenge, safe_message);
 }
 
-esp_err_t idf_esim_lpa_authenticate_server(const std::vector<uint8_t>& request,
+esp_err_t idf_esim_lpa_authenticate_server(uint8_t slot,
+                                           const std::vector<uint8_t>& request,
                                            std::vector<uint8_t>& response,
                                            std::string& safe_message)
 {
+    if (!idf_modem_slot_valid(slot)) return ESP_ERR_INVALID_ARG;
     if (request.empty() || request.size() > 16U * 1024U) {
         safe_message = "AuthenticateServer 数据对象大小无效";
         response.clear();
@@ -1097,13 +1119,15 @@ esp_err_t idf_esim_lpa_authenticate_server(const std::vector<uint8_t>& request,
         response.clear();
         return ESP_ERR_INVALID_ARG;
     }
-    return invoke_es10_raw(request, true, response, safe_message);
+    return invoke_es10_raw(slot, request, true, response, safe_message);
 }
 
-esp_err_t idf_esim_lpa_prepare_download(const std::vector<uint8_t>& request,
+esp_err_t idf_esim_lpa_prepare_download(uint8_t slot,
+                                        const std::vector<uint8_t>& request,
                                         std::vector<uint8_t>& response,
                                         std::string& safe_message)
 {
+    if (!idf_modem_slot_valid(slot)) return ESP_ERR_INVALID_ARG;
     if (request.empty() || request.size() > 16U * 1024U) {
         safe_message = "PrepareDownload 数据对象大小无效";
         response.clear();
@@ -1117,15 +1141,17 @@ esp_err_t idf_esim_lpa_prepare_download(const std::vector<uint8_t>& request,
         response.clear();
         return ESP_ERR_INVALID_ARG;
     }
-    return invoke_es10_raw(request, true, response, safe_message);
+    return invoke_es10_raw(slot, request, true, response, safe_message);
 }
 
 esp_err_t idf_esim_lpa_retrieve_notifications(
+    uint8_t slot,
     std::vector<uint8_t>& encoded_response,
     size_t& list_offset,
     size_t& list_length,
     std::string& safe_message)
 {
+    if (!idf_modem_slot_valid(slot)) return ESP_ERR_INVALID_ARG;
     encoded_response.clear();
     list_offset = 0;
     list_length = 0;
@@ -1136,7 +1162,7 @@ esp_err_t idf_esim_lpa_retrieve_notifications(
     // 也兼容拒绝 operation/sequence 筛选、但支持无条件检索的 eUICC。
     std::vector<uint8_t> request = {0xBF, 0x2B, 0x00};
 
-    esp_err_t err = invoke_es10_raw(request, true, encoded_response, safe_message);
+    esp_err_t err = invoke_es10_raw(slot, request, true, encoded_response, safe_message);
     if (err != ESP_OK) return err;
 
     size_t pos = 0;
@@ -1179,9 +1205,11 @@ esp_err_t idf_esim_lpa_retrieve_notifications(
     return ESP_OK;
 }
 
-esp_err_t idf_esim_lpa_remove_notification(uint32_t sequence_number,
-                                            std::string& safe_message)
+esp_err_t idf_esim_lpa_remove_notification(uint8_t slot,
+                                           uint32_t sequence_number,
+                                           std::string& safe_message)
 {
+    if (!idf_modem_slot_valid(slot)) return ESP_ERR_INVALID_ARG;
     std::vector<uint8_t> integer;
     uint32_t value = sequence_number;
     do {
@@ -1198,7 +1226,7 @@ esp_err_t idf_esim_lpa_remove_notification(uint32_t sequence_number,
     std::vector<uint8_t> request;
     append_tlv(request, TAG_REMOVE_NOTIFICATION, body);
     std::vector<uint8_t> response;
-    esp_err_t err = invoke_es10_raw(request, true, response, safe_message);
+    esp_err_t err = invoke_es10_raw(slot, request, true, response, safe_message);
     if (err != ESP_OK) return err;
 
     // SW=9000 只表示 APDU 传输成功，还必须检查 BF30 的业务状态。
@@ -1218,7 +1246,8 @@ esp_err_t idf_esim_lpa_remove_notification(uint32_t sequence_number,
             return ESP_OK;
         case 0x01:
             // 服务器已确认通知，卡侧目标状态已满足；重复清理应保持幂等成功。
-            idf_log_line("eSIM 待处理通知已不在卡侧列表中");
+            idf_logf("slot=%u eSIM 待处理通知已不在卡侧列表中",
+                     static_cast<unsigned>(slot));
             return ESP_OK;
         case 0x7F:
             safe_message = "eUICC 删除待处理通知失败";
@@ -1236,16 +1265,17 @@ IdfEsimLpaBppSession::~IdfEsimLpaBppSession()
     close();
 }
 
-esp_err_t IdfEsimLpaBppSession::begin_segment(std::string& safe_message)
+esp_err_t IdfEsimLpaBppSession::begin_segment(uint8_t slot, std::string& safe_message)
 {
+    if (!idf_modem_slot_valid(slot)) return ESP_ERR_INVALID_ARG;
     close();
     auto* impl = new (std::nothrow) IdfEsimLpaBppSessionImpl();
     if (!impl) {
         safe_message = "BPP segment 会话内存不足";
         return ESP_ERR_NO_MEM;
     }
-    impl->guard.reset(new (std::nothrow) EsimOperationGuard());
-    impl->session.reset(new (std::nothrow) EsimApduSession(true));
+    impl->guard.reset(new (std::nothrow) EsimOperationGuard(slot));
+    impl->session.reset(new (std::nothrow) EsimApduSession(slot, true));
     if (!impl->guard || !impl->session) {
         impl->session.reset();
         impl->guard.reset();
@@ -1292,13 +1322,15 @@ void IdfEsimLpaBppSession::close()
     impl_ = nullptr;
 }
 
-esp_err_t idf_esim_list_profiles(std::vector<IdfEsimProfile>& profiles,
+esp_err_t idf_esim_list_profiles(uint8_t slot,
+                                 std::vector<IdfEsimProfile>& profiles,
                                  std::string& eid,
                                  std::string& message)
 {
+    if (!idf_modem_slot_valid(slot)) return ESP_ERR_INVALID_ARG;
     std::string eid_msg;
-    esp_err_t eid_err = read_eid(eid, eid_msg);
-    esp_err_t list_err = read_profiles(profiles, message);
+    esp_err_t eid_err = read_eid(slot, eid, eid_msg);
+    esp_err_t list_err = read_profiles(slot, profiles, message);
     if (list_err == ESP_OK) {
         if (eid_err != ESP_OK) {
             message += "；EID 读取失败: " + eid_msg;
@@ -1311,34 +1343,47 @@ esp_err_t idf_esim_list_profiles(std::vector<IdfEsimProfile>& profiles,
     return list_err;
 }
 
-esp_err_t idf_esim_enable_profile(const std::string& identifier, std::string& message)
-{
-    return profile_operation(identifier, true, message);
-}
-
-esp_err_t idf_esim_disable_profile(const std::string& identifier, std::string& message)
-{
-    return profile_operation(identifier, false, message);
-}
-
-esp_err_t idf_esim_delete_profile(const std::string& identifier,
+esp_err_t idf_esim_enable_profile(uint8_t slot,
+                                  const std::string& identifier,
                                   std::string& message)
 {
-    return delete_profile(identifier, message);
+    if (!idf_modem_slot_valid(slot)) return ESP_ERR_INVALID_ARG;
+    return profile_operation(slot, identifier, true, message);
 }
 
-esp_err_t idf_esim_set_nickname(const std::string& identifier,
+esp_err_t idf_esim_disable_profile(uint8_t slot,
+                                   const std::string& identifier,
+                                   std::string& message)
+{
+    if (!idf_modem_slot_valid(slot)) return ESP_ERR_INVALID_ARG;
+    return profile_operation(slot, identifier, false, message);
+}
+
+esp_err_t idf_esim_delete_profile(uint8_t slot,
+                                  const std::string& identifier,
+                                  std::string& message)
+{
+    if (!idf_modem_slot_valid(slot)) return ESP_ERR_INVALID_ARG;
+    return delete_profile(slot, identifier, message);
+}
+
+esp_err_t idf_esim_set_nickname(uint8_t slot,
+                                const std::string& identifier,
                                 const std::string& nickname,
                                 std::string& message)
 {
-    return set_profile_nickname(identifier, nickname, message);
+    if (!idf_modem_slot_valid(slot)) return ESP_ERR_INVALID_ARG;
+    return set_profile_nickname(slot, identifier, nickname, message);
 }
 
-esp_err_t idf_esim_switch_profile(const std::string& identifier, std::string& message)
+esp_err_t idf_esim_switch_profile(uint8_t slot,
+                                  const std::string& identifier,
+                                  std::string& message)
 {
+    if (!idf_modem_slot_valid(slot)) return ESP_ERR_INVALID_ARG;
     std::vector<IdfEsimProfile> profiles;
     std::string list_msg;
-    esp_err_t err = read_profiles(profiles, list_msg);
+    esp_err_t err = read_profiles(slot, profiles, list_msg);
     if (err != ESP_OK) {
         message = "切换前无法读取 Profile 列表: " + list_msg;
         return err;
@@ -1354,7 +1399,7 @@ esp_err_t idf_esim_switch_profile(const std::string& identifier, std::string& me
         // 列表条目可能缺 ICCID(5A tag)，退回 ISD-P AID 启用
         const std::string& enable_id = profile.iccid.empty() ? profile.isdpAid : profile.iccid;
         if (enable_id.empty()) break;  // 两者都没有则走下面的直接标识兜底
-        err = idf_esim_enable_profile(enable_id, message);
+        err = idf_esim_enable_profile(slot, enable_id, message);
         if (err == ESP_OK) {
             message = "已切换到 eSIM Profile: " + idf_esim_mask_profile_id(enable_id) +
                       "，模组重启附着新卡中";
@@ -1366,7 +1411,7 @@ esp_err_t idf_esim_switch_profile(const std::string& identifier, std::string& me
     ProfileIdentifier direct;
     std::string direct_msg;
     if (make_direct_identifier(identifier, false, direct, direct_msg)) {
-        err = idf_esim_enable_profile(identifier, message);
+        err = idf_esim_enable_profile(slot, identifier, message);
         if (err == ESP_OK) {
             message = "已按输入标识尝试启用 eSIM Profile: " + idf_esim_mask_profile_id(identifier) +
                       "，模组重启附着新卡中";

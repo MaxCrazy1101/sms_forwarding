@@ -23,6 +23,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "idf_config.h"
@@ -43,7 +44,25 @@
 static const char* TAG = "idf_web";
 static httpd_handle_t s_server = nullptr;
 static SemaphoreHandle_t s_cell_job_mutex = nullptr;
+static QueueHandle_t s_heavy_job_queue = nullptr;
+static TaskHandle_t s_heavy_worker = nullptr;
 static bool s_scheduler_started = false;
+
+static constexpr UBaseType_t HEAVY_JOB_QUEUE_LENGTH = 4;
+static constexpr uint32_t HEAVY_WORKER_STACK = 8192;
+
+enum class HeavyJobKind : uint8_t {
+    Esim,
+    Ping,
+    KeepAlive,
+    Scheduler,
+};
+
+struct HeavyJob {
+    HeavyJobKind kind;
+    uint8_t slot;
+    void* arg;
+};
 
 struct WebAsyncJob {
     uint8_t slot = 0;
@@ -71,7 +90,7 @@ static WebAsyncJob s_keepalive_job;
 static WebAsyncJob s_esim_job;
 static WebAsyncJob s_sched_job;
 static int s_sched_job_index = -1;
-static EsimWebCache s_esim_cache;
+static EsimWebCache s_esim_cache[IDF_MODEM_SLOT_COUNT];
 // Confirmation Code 只在等待期间保存在 RAM，绝不放入 WebAsyncJob/status。
 static std::string s_esim_confirmation_code;
 static bool s_esim_confirmation_submitted = false;
@@ -82,6 +101,8 @@ static bool cell_job_lock(TickType_t ticks = pdMS_TO_TICKS(300));
 static void cell_job_unlock(void);
 static bool cellular_job_active_locked(void);
 static bool cellular_job_active(void);
+static void heavy_worker_task(void*);
+static bool enqueue_heavy_job(HeavyJobKind kind, uint8_t slot, void* arg);
 static void set_json_no_cache(httpd_req_t* req);
 static bool valid_ussd_code(const std::string& code);
 static bool run_ussd(uint8_t slot, const std::string& code, std::string& resp_out);
@@ -2278,6 +2299,30 @@ static void cell_job_unlock(void)
     xSemaphoreGive(s_cell_job_mutex);
 }
 
+// 调用方已把对应 WebAsyncJob 标记为 queued，并保留 arg 所有权直到成功入队。
+// worker 句柄和队列只在 s_cell_job_mutex 下变更，避免“队列刚排空时入队”丢唤醒。
+static bool enqueue_heavy_job(HeavyJobKind kind, uint8_t slot, void* arg)
+{
+    if (!cell_job_lock(portMAX_DELAY)) return false;
+    if (!s_heavy_job_queue) {
+        cell_job_unlock();
+        return false;
+    }
+    if (!s_heavy_worker) {
+        TaskHandle_t worker = nullptr;
+        if (xTaskCreate(heavy_worker_task, "idf_heavy", HEAVY_WORKER_STACK,
+                        nullptr, 3, &worker) != pdPASS) {
+            cell_job_unlock();
+            return false;
+        }
+        s_heavy_worker = worker;
+    }
+    HeavyJob job{kind, slot, arg};
+    bool queued = xQueueSend(s_heavy_job_queue, &job, 0) == pdTRUE;
+    cell_job_unlock();
+    return queued;
+}
+
 static bool cellular_job_active_locked(void)
 {
     return s_ping_job.running || s_ping_job.queued ||
@@ -2320,6 +2365,7 @@ struct PingTaskArg {
 };
 
 struct EsimTaskArg {
+    uint8_t slot = 0;
     std::string action;
     std::string identifier;
     std::string nickname;
@@ -2327,22 +2373,26 @@ struct EsimTaskArg {
     LpaActivationCode activationCode;
 };
 
-static void lpa_job_set_phase(void*, const char* phase, const char* phase_message)
+static void lpa_job_set_phase(void* context, const char* phase, const char* phase_message)
 {
+    const uint8_t slot = *static_cast<const uint8_t*>(context);
     if (!cell_job_lock()) return;
-    s_esim_job.installPhase = phase ? phase : "";
-    if (phase_message && *phase_message) s_esim_job.message = phase_message;
+    if (s_esim_job.slot == slot) {
+        s_esim_job.installPhase = phase ? phase : "";
+        if (phase_message && *phase_message) s_esim_job.message = phase_message;
+    }
     cell_job_unlock();
 }
 
-static esp_err_t lpa_job_wait_confirmation(void*, std::string& code, std::string& message)
+static esp_err_t lpa_job_wait_confirmation(void* context, std::string& code, std::string& message)
 {
+    const uint8_t slot = *static_cast<const uint8_t*>(context);
     code.clear();
     for (int i = 0; i < 600; ++i) {
         vTaskDelay(pdMS_TO_TICKS(500));
         bool received = false;
         if (cell_job_lock()) {
-            if (s_esim_confirmation_submitted) {
+            if (s_esim_job.slot == slot && s_esim_confirmation_submitted) {
                 code = std::move(s_esim_confirmation_code);
                 s_esim_confirmation_submitted = false;
                 received = true;
@@ -2368,16 +2418,17 @@ static std::string esim_action_label(const std::string& action)
     return "eSIM 操作";
 }
 
-static bool copy_esim_state(WebAsyncJob& job,
+static bool copy_esim_state(uint8_t slot,
+                            WebAsyncJob& job,
                             std::string& eid,
                             std::vector<IdfEsimProfile>& profiles,
                             uint32_t& updated_at)
 {
     if (!cell_job_lock()) return false;
     job = s_esim_job;
-    eid = s_esim_cache.eid;
-    profiles = s_esim_cache.profiles;
-    updated_at = s_esim_cache.updatedAt;
+    eid = s_esim_cache[slot].eid;
+    profiles = s_esim_cache[slot].profiles;
+    updated_at = s_esim_cache[slot].updatedAt;
     cell_job_unlock();
     return true;
 }
@@ -2395,9 +2446,10 @@ static void append_esim_profile_json(std::string& body, const IdfEsimProfile& p)
     body += "}";
 }
 
-static void esim_task(void* arg_raw)
+static bool esim_runner(void* arg_raw)
 {
     EsimTaskArg* arg = static_cast<EsimTaskArg*>(arg_raw);
+    uint8_t slot = arg->slot;
     std::string action = std::move(arg->action);
     std::string identifier = std::move(arg->identifier);
     std::string nickname = std::move(arg->nickname);
@@ -2424,14 +2476,16 @@ static void esim_task(void* arg_raw)
     bool cache_ready = false;
     if (action == "install-start") {
         LpaDownloadObserver observer;
+        observer.context = &slot;
         observer.allow_missing_admin_protocol = allow_missing_admin_protocol;
         observer.set_phase = lpa_job_set_phase;
         observer.wait_confirmation_code = lpa_job_wait_confirmation;
         LpaDownloadStats stats;
-        err = idf_lpa_run_profile_download(activation_code, observer, stats, message);
+        err = idf_lpa_run_profile_download(slot, activation_code, observer, stats, message);
         // 仅输出资源计数，便于真机比较不同 BPP；不包含任何下载凭据或协议载荷。
-        idf_logf("eSIM下载资源汇总: result=%s bppEncodedBytes=%u bppDecodedBytes=%u "
+        idf_logf("slot=%u eSIM下载资源汇总: result=%s bppEncodedBytes=%u bppDecodedBytes=%u "
                  "freeHeapAtStart=%u minimumFreeHeap=%u largestFreeBlock=%u freeHeapAtEnd=%u",
+                 static_cast<unsigned>(slot),
                  err == ESP_OK ? "success" : esp_err_to_name(err),
                  static_cast<unsigned>(stats.bppEncodedBytes),
                  static_cast<unsigned>(stats.bppDecodedBytes),
@@ -2441,7 +2495,7 @@ static void esim_task(void* arg_raw)
                  static_cast<unsigned>(stats.freeHeapAtEnd));
         if (err == ESP_OK) {
             std::string refresh_message;
-            err = idf_esim_list_profiles(profiles, eid, refresh_message);
+            err = idf_esim_list_profiles(slot, profiles, eid, refresh_message);
             if (err != ESP_OK) {
                 message = "Profile 已写入，但刷新列表失败：" + refresh_message;
             } else {
@@ -2449,20 +2503,20 @@ static void esim_task(void* arg_raw)
             }
         }
     } else if (action == "refresh") {
-        err = idf_esim_list_profiles(profiles, eid, message);
+        err = idf_esim_list_profiles(slot, profiles, eid, message);
     } else if (action == "info") {
-        err = idf_esim_get_eid(eid, message);
+        err = idf_esim_get_eid(slot, eid, message);
         cache_eid_only = (err == ESP_OK);
     } else if (action == "enable") {
-        err = idf_esim_enable_profile(identifier, message);
+        err = idf_esim_enable_profile(slot, identifier, message);
     } else if (action == "disable") {
-        err = idf_esim_disable_profile(identifier, message);
+        err = idf_esim_disable_profile(slot, identifier, message);
     } else if (action == "delete") {
-        err = idf_esim_delete_profile(identifier, message);
+        err = idf_esim_delete_profile(slot, identifier, message);
     } else if (action == "nickname") {
-        err = idf_esim_set_nickname(identifier, nickname, message);
+        err = idf_esim_set_nickname(slot, identifier, nickname, message);
     } else if (action == "switch") {
-        err = idf_esim_switch_profile(identifier, message);
+        err = idf_esim_switch_profile(slot, identifier, message);
     } else {
         message = "未知 eSIM 操作";
     }
@@ -2472,14 +2526,14 @@ static void esim_task(void* arg_raw)
     // 启用/切换/禁用改变当前生效的卡：让模组重读号码/ICCID/运营商，避免概览沿用旧卡缓存
     bool sim_changed = ok && (action == "enable" || action == "switch" || action == "disable");
     if (sim_changed) {
-        idf_modem_invalidate_sim_identity(0);
+        idf_modem_invalidate_sim_identity(slot);
     }
     if (ok && (action == "delete" || action == "nickname")) {
         // 不影响当前 UICC 会话的操作：立即回读一次列表刷新缓存
         std::string refresh_msg;
         std::vector<IdfEsimProfile> refreshed;
         std::string refreshed_eid;
-        if (idf_esim_list_profiles(refreshed, refreshed_eid, refresh_msg) == ESP_OK) {
+        if (idf_esim_list_profiles(slot, refreshed, refreshed_eid, refresh_msg) == ESP_OK) {
             profiles = std::move(refreshed);
             eid = std::move(refreshed_eid);
             cache_ready = true;
@@ -2497,19 +2551,20 @@ static void esim_task(void* arg_raw)
         : message;
     activation_code.clear_sensitive();
     if (cell_job_lock(portMAX_DELAY)) {
-        bool eid_changed = !eid.empty() && !s_esim_cache.eid.empty() && eid != s_esim_cache.eid;
+        EsimWebCache& cache = s_esim_cache[slot];
+        bool eid_changed = !eid.empty() && !cache.eid.empty() && eid != cache.eid;
         if (cache_eid_only) {
-            if (eid_changed) s_esim_cache.profiles.clear();
-            s_esim_cache.eid = eid;
-            s_esim_cache.updatedAt = static_cast<uint32_t>(time(nullptr));
+            if (eid_changed) cache.profiles.clear();
+            cache.eid = eid;
+            cache.updatedAt = static_cast<uint32_t>(time(nullptr));
         } else if (cache_ready) {
-            s_esim_cache.eid = eid;
-            s_esim_cache.profiles = profiles;
-            s_esim_cache.updatedAt = static_cast<uint32_t>(time(nullptr));
+            cache.eid = eid;
+            cache.profiles = profiles;
+            cache.updatedAt = static_cast<uint32_t>(time(nullptr));
         } else if (ok) {
             // 启用、禁用或切换 Profile 仍在同一张 eUICC 上，只清当前 Profile 列表。
-            s_esim_cache.profiles.clear();
-            s_esim_cache.updatedAt = static_cast<uint32_t>(time(nullptr));
+            cache.profiles.clear();
+            cache.updatedAt = static_cast<uint32_t>(time(nullptr));
         }
         // 安装认证阶段不修改 Profile/EID 缓存；能力仅在该下载任务的 preflight 中读取。
         s_esim_job.running = false;
@@ -2524,11 +2579,13 @@ static void esim_task(void* arg_raw)
         }
         cell_job_unlock();
     }
-    idf_logf("%s: %s", esim_action_label(action).c_str(), ok ? "完成" : final_message.c_str());
-    vTaskDelete(nullptr);
+    idf_logf("slot=%u %s: %s", static_cast<unsigned>(slot), esim_action_label(action).c_str(),
+             ok ? "完成" : final_message.c_str());
+    return ok;
 }
 
-static bool start_esim_job(const std::string& action,
+static bool start_esim_job(uint8_t slot,
+                           const std::string& action,
                            const std::string& identifier,
                            const std::string& nickname,
                            std::string& message,
@@ -2541,9 +2598,9 @@ static bool start_esim_job(const std::string& action,
         message = "eSIM 任务状态锁繁忙";
         return false;
     }
-    if (cellular_job_active_locked()) {
+    if (s_esim_job.running || s_esim_job.queued) {
         already_running = true;
-        message = "已有蜂窝/eSIM 任务正在后台执行";
+        message = "已有 eSIM 任务正在后台执行";
         cell_job_unlock();
         return false;
     }
@@ -2551,6 +2608,7 @@ static bool start_esim_job(const std::string& action,
     s_esim_job.queued = true;
     s_esim_job.done = false;
     s_esim_job.success = false;
+    s_esim_job.slot = slot;
     s_esim_job.action = action;
     if (action == "install-start") {
         idf_lpa_clear_sensitive(s_esim_confirmation_code);
@@ -2580,12 +2638,13 @@ static bool start_esim_job(const std::string& action,
         message = "创建 eSIM 任务失败：内存不足";
         return false;
     }
+    arg->slot = slot;
     arg->action = action;
     arg->identifier = identifier;
     arg->nickname = nickname;
     arg->allowMissingAdminProtocol = allow_missing_admin_protocol;
     arg->activationCode = std::move(activation_code);
-    if (xTaskCreate(esim_task, "idf_esim", 8192, arg, 3, nullptr) != pdPASS) {
+    if (!enqueue_heavy_job(HeavyJobKind::Esim, slot, arg)) {
         delete arg;
         if (cell_job_lock(portMAX_DELAY)) {
             idf_lpa_clear_sensitive(s_esim_confirmation_code);
@@ -2595,20 +2654,20 @@ static bool start_esim_job(const std::string& action,
             s_esim_job.success = false;
             s_esim_job.installHost.clear();
             s_esim_job.installMatchingIdMasked.clear();
-            s_esim_job.message = "创建 eSIM 任务失败";
+            s_esim_job.message = "eSIM 重任务队列已满或 worker 创建失败";
             cell_job_unlock();
         }
-        message = "创建 eSIM 任务失败";
+        message = "eSIM 重任务队列已满或 worker 创建失败";
         return false;
     }
     message = action == "install-start"
         ? "下载 eSIM Profile 已排队"
         : esim_action_label(action) + "已排队";
-    idf_logf("%s已入队", esim_action_label(action).c_str());
+    idf_logf("slot=%u %s已入队", static_cast<unsigned>(slot), esim_action_label(action).c_str());
     return true;
 }
 
-static void ping_task(void* arg_raw)
+static bool ping_runner(void* arg_raw)
 {
     PingTaskArg* arg = static_cast<PingTaskArg*>(arg_raw);
     if (cell_job_lock()) {
@@ -2633,7 +2692,7 @@ static void ping_task(void* arg_raw)
         cell_job_unlock();
     }
     delete arg;
-    vTaskDelete(nullptr);
+    return ok;
 }
 
 static bool valid_ussd_code(const std::string& code)
@@ -2685,29 +2744,29 @@ static void keepalive_set_job_message(const std::string& message)
     }
 }
 
-static bool wait_registered_for(uint32_t timeout_ms)
+static bool wait_registered_for(uint8_t slot, uint32_t timeout_ms)
 {
     // 只看模组任务维护的注册状态，不自己发 CEREG：切卡后模组正在软重启，抢 AT 通道
     // 只会拖慢重启；且重启请求受理时 modemReady 已同步清零，不会把旧 Profile 的
     // 注册状态误判成切换完成(issue #17)
     uint64_t deadline = esp_timer_get_time() + static_cast<uint64_t>(timeout_ms) * 1000ULL;
     while (esp_timer_get_time() < deadline) {
-        if (idf_modem_get_status(0).modemReady) return true;
+        if (idf_modem_get_status(slot).modemReady) return true;
         vTaskDelay(pdMS_TO_TICKS(3000));
     }
     return false;
 }
 
-static bool wait_registered_after_esim_switch(std::string& message)
+static bool wait_registered_after_esim_switch(uint8_t slot, std::string& message)
 {
     // 切卡成功时 idf_esim 已请求模组软重启，这里等待重启后在新 Profile 上重新注册
-    if (wait_registered_for(90000)) {
+    if (wait_registered_for(slot, 90000)) {
         message = "eSIM 切换后网络已注册";
         return true;
     }
     // 超时兜底：再重启一次模组重新附着
     idf_logf("eSIM 切换后 90s 未注册，重启模组重新附着");
-    if (idf_modem_request_reset(0, false) == ESP_OK && wait_registered_for(90000)) {
+    if (idf_modem_request_reset(slot, false) == ESP_OK && wait_registered_for(slot, 90000)) {
         message = "eSIM 切换后经模组重启已注册";
         return true;
     }
@@ -2723,7 +2782,8 @@ struct EsimJobSwitch {
 
 // profile 非空时切换到目标 Profile 并等待网络注册；用同一份列表同时确定
 // "当前启用的卡"与"目标卡"，避免两次读卡。目标已启用则不动作。
-static bool esim_prepare_profile(const std::string& profile,
+static bool esim_prepare_profile(uint8_t slot,
+                                 const std::string& profile,
                                  EsimJobSwitch& sw,
                                  std::string& message)
 {
@@ -2733,7 +2793,7 @@ static bool esim_prepare_profile(const std::string& profile,
     std::vector<IdfEsimProfile> profiles;
     std::string eid;
     std::string list_msg;
-    if (idf_esim_list_profiles(profiles, eid, list_msg) != ESP_OK) {
+    if (idf_esim_list_profiles(slot, profiles, eid, list_msg) != ESP_OK) {
         message = "读取 eSIM Profile 列表失败: " + list_msg;
         return false;
     }
@@ -2760,15 +2820,16 @@ static bool esim_prepare_profile(const std::string& profile,
         enable_id = profile;
     }
 
-    idf_logf("任务准备切换 eSIM: %s", idf_esim_mask_profile_id(enable_id).c_str());
+    idf_logf("slot=%u 任务准备切换 eSIM: %s", static_cast<unsigned>(slot),
+             idf_esim_mask_profile_id(enable_id).c_str());
     std::string switch_msg;
-    if (idf_esim_enable_profile(enable_id, switch_msg) != ESP_OK) {
+    if (idf_esim_enable_profile(slot, enable_id, switch_msg) != ESP_OK) {
         message = (target ? "eSIM 切换失败: " : "未找到目标 Profile 且直接启用失败: ") + switch_msg;
         return false;
     }
     sw.switched = true;
     std::string wait_msg;
-    if (!wait_registered_after_esim_switch(wait_msg)) {
+    if (!wait_registered_after_esim_switch(slot, wait_msg)) {
         message = wait_msg;
         return false;  // sw.switched 保持 true，调用方仍应尝试切回
     }
@@ -2777,7 +2838,9 @@ static bool esim_prepare_profile(const std::string& profile,
     return true;
 }
 
-static void esim_restore_profile(const EsimJobSwitch& sw, std::string& message)
+static void esim_restore_profile(uint8_t slot,
+                                 const EsimJobSwitch& sw,
+                                 std::string& message)
 {
     if (!sw.switched) return;
     if (sw.original.empty()) {
@@ -2785,14 +2848,14 @@ static void esim_restore_profile(const EsimJobSwitch& sw, std::string& message)
         return;
     }
     std::string masked = idf_esim_mask_profile_id(sw.original);
-    idf_logf("任务完成，切回原 eSIM: %s", masked.c_str());
+    idf_logf("slot=%u 任务完成，切回原 eSIM: %s", static_cast<unsigned>(slot), masked.c_str());
     std::string msg;
-    if (idf_esim_enable_profile(sw.original, msg) != ESP_OK) {
+    if (idf_esim_enable_profile(slot, sw.original, msg) != ESP_OK) {
         message = "切回原 Profile 失败: " + msg;
         return;
     }
     std::string wait_msg;
-    wait_registered_after_esim_switch(wait_msg);
+    wait_registered_after_esim_switch(slot, wait_msg);
     message = "已切回原 Profile " + masked + "；" + wait_msg;
 }
 
@@ -2800,10 +2863,10 @@ static bool keepalive_prepare_esim(const IdfKeepaliveRunView& cfg, EsimJobSwitch
 {
     if (cfg.kaProfile.empty()) return true;
     keepalive_set_job_message("保号动作执行中，正在切换 eSIM: " + idf_esim_mask_profile_id(cfg.kaProfile));
-    return esim_prepare_profile(cfg.kaProfile, sw, message);
+    return esim_prepare_profile(cfg.slot, cfg.kaProfile, sw, message);
 }
 
-static void keepalive_task(void* arg_raw)
+static bool keepalive_runner(void* arg_raw)
 {
     KeepAliveTaskArg* arg = static_cast<KeepAliveTaskArg*>(arg_raw);
     IdfKeepaliveRunView cfg = std::move(arg->config);
@@ -2856,7 +2919,7 @@ static void keepalive_task(void* arg_raw)
     if (esim_switch.switched) {
         keepalive_set_job_message("保号动作完成，正在切回原 eSIM Profile");
         std::string back_msg;
-        esim_restore_profile(esim_switch, back_msg);
+        esim_restore_profile(cfg.slot, esim_switch, back_msg);
         if (!back_msg.empty()) message += "；" + back_msg;
     }
 
@@ -2900,7 +2963,7 @@ static void keepalive_task(void* arg_raw)
                                      : (message.empty() ? "保号动作失败，请查看日志" : message);
         cell_job_unlock();
     }
-    vTaskDelete(nullptr);
+    return ok;
 }
 
 static bool start_keepalive_job(const IdfKeepaliveRunView& cfg, const char* queued_message,
@@ -2911,9 +2974,9 @@ static bool start_keepalive_job(const IdfKeepaliveRunView& cfg, const char* queu
         message = "保号任务状态锁繁忙";
         return false;
     }
-    if (cellular_job_active_locked()) {
+    if (s_keepalive_job.running || s_keepalive_job.queued) {
         already_running = true;
-        message = "已有蜂窝/保号任务正在后台执行";
+        message = "已有保号任务正在后台执行";
         cell_job_unlock();
         return false;
     }
@@ -2941,17 +3004,16 @@ static bool start_keepalive_job(const IdfKeepaliveRunView& cfg, const char* queu
         return false;
     }
     arg->config = cfg;
-    // 8192：kaProfile 路径会走完整 eSIM 列表/切换/TLV 解析链，6144 余量不足
-    if (xTaskCreate(keepalive_task, "idf_keepalive", 8192, arg, 3, nullptr) != pdPASS) {
+    if (!enqueue_heavy_job(HeavyJobKind::KeepAlive, cfg.slot, arg)) {
         delete arg;
         if (cell_job_lock(portMAX_DELAY)) {
             s_keepalive_job.queued = false;
             s_keepalive_job.done = true;
             s_keepalive_job.success = false;
-            s_keepalive_job.message = "创建保号任务失败";
+            s_keepalive_job.message = "保号重任务队列已满或 worker 创建失败";
             cell_job_unlock();
         }
-        message = "创建保号任务失败";
+        message = "保号重任务队列已满或 worker 创建失败";
         return false;
     }
     message = queued;
@@ -3080,7 +3142,7 @@ static bool sched_run_action(const IdfSchedRunView& cfg,
     }
 }
 
-static void sched_task_worker(void* arg_raw)
+static bool sched_runner(void* arg_raw)
 {
     SchedTaskArg* arg = static_cast<SchedTaskArg*>(arg_raw);
     IdfSchedRunView cfg = std::move(arg->config);
@@ -3104,7 +3166,7 @@ static void sched_task_worker(void* arg_raw)
     if (!t.profile.empty()) {
         sched_set_job_message(label + ": 正在切换 eSIM Profile");
         std::string prep_msg;
-        prep_ok = esim_prepare_profile(t.profile, sw, prep_msg);
+        prep_ok = esim_prepare_profile(t.slot, t.profile, sw, prep_msg);
         if (!prep_msg.empty()) message = prep_msg;
     }
     if (prep_ok) {
@@ -3117,7 +3179,7 @@ static void sched_task_worker(void* arg_raw)
     if (sw.switched && t.switchBack) {
         sched_set_job_message(label + ": 正在切回原 eSIM Profile");
         std::string back_msg;
-        esim_restore_profile(sw, back_msg);
+        esim_restore_profile(t.slot, sw, back_msg);
         if (!back_msg.empty()) message += "；" + back_msg;
     }
 
@@ -3153,6 +3215,51 @@ static void sched_task_worker(void* arg_raw)
     }
     if (ok) idf_logf("定时任务完成: %s", label.c_str());
     else idf_logf("定时任务失败: %s: %s", label.c_str(), message.c_str());
+    return ok;
+}
+
+static const char* heavy_job_name(HeavyJobKind kind)
+{
+    switch (kind) {
+        case HeavyJobKind::Esim: return "esim";
+        case HeavyJobKind::Ping: return "ping";
+        case HeavyJobKind::KeepAlive: return "keepalive";
+        case HeavyJobKind::Scheduler: return "scheduler";
+    }
+    return "unknown";
+}
+
+static void heavy_worker_task(void*)
+{
+    while (true) {
+        HeavyJob job{};
+        if (xQueueReceive(s_heavy_job_queue, &job, 0) == pdTRUE) {
+            idf_logf("重任务开始: kind=%s slot=%u", heavy_job_name(job.kind),
+                     static_cast<unsigned>(job.slot));
+            idf_push_heavy_operation_lock();
+            bool success = false;
+            switch (job.kind) {
+                case HeavyJobKind::Esim: success = esim_runner(job.arg); break;
+                case HeavyJobKind::Ping: success = ping_runner(job.arg); break;
+                case HeavyJobKind::KeepAlive: success = keepalive_runner(job.arg); break;
+                case HeavyJobKind::Scheduler: success = sched_runner(job.arg); break;
+            }
+            idf_push_heavy_operation_unlock();
+            idf_logf("重任务结束: kind=%s slot=%u result=%s", heavy_job_name(job.kind),
+                     static_cast<unsigned>(job.slot), success ? "success" : "failed");
+            continue;
+        }
+
+        // 与 enqueue_heavy_job 共用状态锁复查队列；排空后删除 8 KiB worker 栈。
+        if (cell_job_lock(portMAX_DELAY)) {
+            if (uxQueueMessagesWaiting(s_heavy_job_queue) == 0) {
+                s_heavy_worker = nullptr;
+                cell_job_unlock();
+                break;
+            }
+            cell_job_unlock();
+        }
+    }
     vTaskDelete(nullptr);
 }
 
@@ -3171,9 +3278,9 @@ static bool start_sched_job(const IdfSchedRunView& cfg, int index, std::string& 
         message = "任务状态锁繁忙";
         return false;
     }
-    if (cellular_job_active_locked()) {
+    if (s_sched_job.running || s_sched_job.queued) {
         already_running = true;
-        message = "已有蜂窝/eSIM 任务正在后台执行";
+        message = "该定时任务类型已有作业正在后台执行";
         cell_job_unlock();
         return false;
     }
@@ -3198,16 +3305,16 @@ static bool start_sched_job(const IdfSchedRunView& cfg, int index, std::string& 
     }
     arg->config = cfg;
     arg->index = index;
-    if (xTaskCreate(sched_task_worker, "idf_schedtask", 8192, arg, 3, nullptr) != pdPASS) {
+    if (!enqueue_heavy_job(HeavyJobKind::Scheduler, cfg.task.slot, arg)) {
         delete arg;
         if (cell_job_lock(portMAX_DELAY)) {
             s_sched_job.queued = false;
             s_sched_job.done = true;
             s_sched_job.success = false;
-            s_sched_job.message = "创建定时任务失败";
+            s_sched_job.message = "定时重任务队列已满或 worker 创建失败";
             cell_job_unlock();
         }
-        message = "创建定时任务失败";
+        message = "定时重任务队列已满或 worker 创建失败";
         return false;
     }
     message = "定时任务已排队";
@@ -3378,7 +3485,9 @@ static esp_err_t handle_ping(httpd_req_t* req)
             job = s_ping_job;
             cell_job_unlock();
         }
-        std::string body = "{\"running\":";
+        std::string body = "{\"queued\":";
+        body += job.queued ? "true" : "false";
+        body += ",\"running\":";
         body += job.running ? "true" : "false";
         body += ",\"done\":";
         body += job.done ? "true" : "false";
@@ -3420,17 +3529,17 @@ static esp_err_t handle_ping(httpd_req_t* req)
     if (!cell_job_lock()) {
         return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"蜂窝任务状态锁繁忙\"}");
     }
-    if (cellular_job_active_locked()) {
+    if (s_ping_job.running || s_ping_job.queued) {
         cell_job_unlock();
-        return httpd_resp_sendstr(req, "{\"success\":false,\"running\":true,\"message\":\"已有蜂窝任务正在执行，请稍候\"}");
+        return httpd_resp_sendstr(req, "{\"success\":false,\"running\":true,\"message\":\"已有蜂窝 HTTP 任务正在执行，请稍候\"}");
     }
 
     s_ping_job = WebAsyncJob();
     s_ping_job.slot = slot;
-    s_ping_job.running = true;
+    s_ping_job.running = false;
     s_ping_job.queued = true;
     s_ping_job.url = url;
-    s_ping_job.message = "后台HTTP payload 下载中";
+    s_ping_job.message = "后台 HTTP payload 下载已排队";
     cell_job_unlock();
 
     PingTaskArg* arg = new (std::nothrow) PingTaskArg();
@@ -3450,22 +3559,22 @@ static esp_err_t handle_ping(httpd_req_t* req)
     arg->url = url;
     arg->slot = slot;
     arg->cellular = cellular_http_config(current.dataEnabled, current.apn);
-    if (xTaskCreate(ping_task, "idf_ping_http", 6144, arg, 3, nullptr) != pdPASS) {
+    if (!enqueue_heavy_job(HeavyJobKind::Ping, slot, arg)) {
         delete arg;
         if (cell_job_lock(portMAX_DELAY)) {
             s_ping_job.running = false;
             s_ping_job.queued = false;
             s_ping_job.done = true;
             s_ping_job.success = false;
-            s_ping_job.message = "创建蜂窝HTTP任务失败";
+            s_ping_job.message = "蜂窝 HTTP 重任务队列已满或 worker 创建失败";
             cell_job_unlock();
         }
-        return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"创建任务失败\"}");
+        return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"蜂窝 HTTP 重任务队列已满或 worker 创建失败\"}");
     }
 
     idf_logf("slot=%u 网页端发起后台HTTP payload 请求: %s",
              slot, redact_url_for_log(url).c_str());
-    return httpd_resp_sendstr(req, "{\"success\":true,\"running\":true,\"message\":\"已开始后台HTTP payload下载，可继续刷新网页\"}");
+    return httpd_resp_sendstr(req, "{\"success\":true,\"queued\":true,\"running\":false,\"message\":\"后台 HTTP payload 下载已排队，可继续刷新网页\"}");
 }
 
 static esp_err_t handle_esim(httpd_req_t* req)
@@ -3476,13 +3585,15 @@ static esp_err_t handle_esim(httpd_req_t* req)
     get_query_param(req, "action", action);
     if (action.empty()) action = "status";
     set_json_no_cache(req);
+    uint8_t slot = 0;
+    if (!query_slot(req, slot)) return reject_invalid_slot(req);
 
     if (action == "status") {
         WebAsyncJob job;
         std::string eid;
         std::vector<IdfEsimProfile> profiles;
         uint32_t updated_at = 0;
-        if (!copy_esim_state(job, eid, profiles, updated_at)) {
+        if (!copy_esim_state(slot, job, eid, profiles, updated_at)) {
             httpd_resp_set_status(req, "503 Service Unavailable");
             return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"eSIM 状态暂不可用\"}");
         }
@@ -3493,13 +3604,15 @@ static esp_err_t handle_esim(httpd_req_t* req)
         snprintf(buf, sizeof(buf),
                  "{\"jobQueued\":%s,\"jobRunning\":%s,\"jobDone\":%s,"
                  "\"jobSuccess\":%s,\"success\":%s,\"queued\":%s,"
-                 "\"updatedAt\":%u,\"profileCount\":%u,",
+                 "\"slot\":%u,\"jobSlot\":%u,\"updatedAt\":%u,\"profileCount\":%u,",
                  job.queued ? "true" : "false",
                  job.running ? "true" : "false",
                  job.done ? "true" : "false",
                  job.success ? "true" : "false",
                  job.success ? "true" : "false",
                  (job.queued || job.running) ? "true" : "false",
+                 static_cast<unsigned>(slot),
+                 static_cast<unsigned>(job.slot),
                  static_cast<unsigned>(updated_at),
                  static_cast<unsigned>(profiles.size()));
         body += buf;
@@ -3609,7 +3722,7 @@ static esp_err_t handle_esim(httpd_req_t* req)
         }
         bool accepted = false;
         if (valid && cell_job_lock()) {
-            if (s_esim_job.action == "install-start" && s_esim_job.running &&
+            if (s_esim_job.slot == slot && s_esim_job.action == "install-start" && s_esim_job.running &&
                 !s_esim_job.done && s_esim_job.installPhase == "waiting_confirmation" &&
                 !s_esim_confirmation_submitted) {
                 s_esim_confirmation_code = *code;
@@ -3626,16 +3739,14 @@ static esp_err_t handle_esim(httpd_req_t* req)
     }
     std::string message;
     bool already_running = false;
-    bool ok = start_esim_job(action, identifier, nickname, message, already_running,
+    bool ok = start_esim_job(slot, action, identifier, nickname, message, already_running,
                              allow_missing_admin_protocol, std::move(activation_code));
     // install-start 的 Activation Code 在解析字段中仍可能存在；先清理整个 form，
     // 再让 LpaActivationCode 的移动对象独立负责剩余短期字段。
     clear_sensitive_form_values(fields);
     idf_lpa_clear_sensitive(raw);
-    bool accepted = ok || already_running;
-    // Activation Code 属于用户短期输入；安装请求撞上已有任务时不能伪装成已入队，
-    // 也不能让前端在未接受时清空输入。
-    if (action == "install-start" && already_running && !ok) accepted = false;
+    // 同类型任务已存在时没有创建新队列项，必须明确拒绝，前端也不能清空输入。
+    bool accepted = ok;
     std::string body = "{\"success\":";
     body += accepted ? "true" : "false";
     body += ",\"queued\":";
@@ -3699,9 +3810,9 @@ static esp_err_t handle_keepalive(httpd_req_t* req)
         bool ok = start_keepalive_job(run_cfg, "保号动作已排队，可继续刷新网页",
                                       message, already_running);
         std::string body = "{\"success\":";
-        body += (ok || already_running) ? "true" : "false";
+        body += ok ? "true" : "false";
         body += ",\"queued\":";
-        body += (ok || already_running) ? "true" : "false";
+        body += ok ? "true" : "false";
         body += ",";
         json_prop(body, "message", message);
         body += "}";
@@ -3816,9 +3927,9 @@ static esp_err_t handle_schedtask(httpd_req_t* req)
         bool ok = start_sched_job(run_cfg, index, message, already);
         if (ok) idf_logf("网页手动触发定时任务%d", index + 1);
         std::string body = "{\"success\":";
-        body += (ok || already) ? "true" : "false";
+        body += ok ? "true" : "false";
         body += ",\"queued\":";
-        body += (ok || already) ? "true" : "false";
+        body += ok ? "true" : "false";
         body += ",";
         json_prop(body, "message", message);
         body += "}";
@@ -3974,9 +4085,15 @@ static esp_err_t register_handler(httpd_handle_t server, const char* uri, int me
 esp_err_t idf_web_start(void)
 {
     if (s_server) return ESP_OK;
+    esp_err_t heavy_init = idf_push_heavy_operation_init();
+    if (heavy_init != ESP_OK) return heavy_init;
     if (!s_cell_job_mutex) {
         s_cell_job_mutex = xSemaphoreCreateMutex();
         if (!s_cell_job_mutex) return ESP_ERR_NO_MEM;
+    }
+    if (!s_heavy_job_queue) {
+        s_heavy_job_queue = xQueueCreate(HEAVY_JOB_QUEUE_LENGTH, sizeof(HeavyJob));
+        if (!s_heavy_job_queue) return ESP_ERR_NO_MEM;
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();

@@ -207,6 +207,8 @@
       el = document.getElementById('simApn'); if (el) el.value = m.apn || '';
       el = document.getElementById('simOperatorPlmn'); if (el) el.value = m.operatorPlmn || '';
       el = document.getElementById('simPhoneNumber'); if (el) el.value = m.phoneNumber || '';
+      if (esimTimer) clearTimeout(esimTimer);
+      esimLoadStatus(false);
       loadStatus();
     }
     function netLedSlotChange() {
@@ -681,7 +683,7 @@
       b.disabled=true;b.textContent='...';
       r.className='result-box result-loading';r.textContent='提交 payload 下载任务...';
       csrfFetch('/ping',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'slot='+slot+'&url='+encodeURIComponent(url)}).then(jsonOrThrow).then(function(d){
-        if(d.success && d.running){ r.textContent='后台下载 payload 中（会短暂开启蜂窝数据）...'; pollPingStatus(); }
+        if(d.success && (d.queued||d.running)){ r.textContent='后台 payload 下载已排队...'; pollPingStatus(); }
         else{ b.disabled=false;b.textContent='下载 payload'; r.className='result-box result-error'; r.textContent=d.message||'任务启动失败'; }
       }).catch(function(e){b.disabled=false;b.textContent='下载 payload';r.className='result-box result-error';r.textContent='请求失败: '+e;});
     }
@@ -690,9 +692,9 @@
       fetch('/ping?action=status&_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(d){
         var b=document.getElementById('pingBtn'),r=document.getElementById('pingResult');
         if(!b||!r)return;
-        if(d.running){
+        if(d.queued||d.running){
           r.className='result-box result-loading';
-          r.textContent='正在通过蜂窝网络下载 payload（后台执行，可刷新网页）...';
+          r.textContent=d.queued?'后台 payload 下载排队中…':'正在通过蜂窝网络下载 payload（后台执行，可刷新网页）...';
           pingPollTimer=setTimeout(pollPingStatus,1000);
           return;
         }
@@ -962,7 +964,7 @@
         el = document.getElementById('kaIntervalDays'); if (el) el.value = d.intervalDays;
         el = document.getElementById('kaAction'); if (el) el.value = d.action;
         el = document.getElementById('kaTarget'); if (el) el.value = d.target || '';
-        profInit('kaProfile', d.profile || '');
+        profInit('kaProfile', d.profile || '', Number(d.slot));
         var kaUrl = normalizeKaUrlForDisplay(d.url);
         el = document.getElementById('kaUrl'); if (el) el.value = kaUrl;
         el = document.getElementById('pingUrl'); if (el) el.value = kaUrl;
@@ -1041,7 +1043,7 @@
     }
 
     // ---- eSIM Profile 下拉选项（来自 /esim 状态缓存，不触发读卡） ----
-    var esimOptions = null;
+    var esimOptions = [null, null];
     function profileOptionsFromProfiles(profiles) {
       return (Array.isArray(profiles) ? profiles : []).map(function(p) {
         var id = p.iccid || p.isdpAid || '';
@@ -1050,18 +1052,18 @@
         return {v: id, t: label};
       }).filter(function(o){ return o.v; });
     }
-    var esimOptionsReq = null;  // 在途请求去重：面板初始化会同时发起 7 次调用
-    function loadEsimOptions(cb) {
-      if (esimOptions) { cb(esimOptions); return; }
-      if (!esimOptionsReq) {
-        esimOptionsReq = fetch('/esim?action=status&_=' + Date.now(), {cache:'no-store'})
+    var esimOptionsReq = [null, null];  // 每槽在途请求去重：面板初始化会同时发起多次调用
+    function loadEsimOptions(slot, cb) {
+      if (esimOptions[slot]) { cb(esimOptions[slot]); return; }
+      if (!esimOptionsReq[slot]) {
+        esimOptionsReq[slot] = fetch('/esim?action=status&slot=' + slot + '&_=' + Date.now(), {cache:'no-store'})
           .then(jsonOrThrow).then(function(d) {
-            esimOptions = profileOptionsFromProfiles(d.profiles);
-            return esimOptions;
+            esimOptions[slot] = profileOptionsFromProfiles(d.profiles);
+            return esimOptions[slot];
           }).catch(function(){ return []; })
-          .then(function(opts){ esimOptionsReq = null; return opts; });
+          .then(function(opts){ esimOptionsReq[slot] = null; return opts; });
       }
-      esimOptionsReq.then(cb);
+      esimOptionsReq[slot].then(cb);
     }
     // 三件套约定：hiddenId(实际提交) / hiddenId+'Sel'(下拉) / hiddenId+'Custom'(手动输入)
     function profSelChange(hiddenId) {
@@ -1073,13 +1075,13 @@
       if (custom) custom.style.display = isCustom ? '' : 'none';
       hidden.value = isCustom ? (custom ? custom.value.trim() : '') : sel.value;
     }
-    function profInit(hiddenId, value) {
+    function profInit(hiddenId, value, slot) {
       var sel = document.getElementById(hiddenId + 'Sel');
       var custom = document.getElementById(hiddenId + 'Custom');
       var hidden = document.getElementById(hiddenId);
       if (!sel || !hidden) return;
       hidden.value = value || '';
-      loadEsimOptions(function(options) {
+      loadEsimOptions(slot, function(options) {
         sel.innerHTML = '';
         function add(v, t) { var o = document.createElement('option'); o.value = v; o.textContent = t; sel.appendChild(o); }
         add('', '不切换（使用当前卡）');
@@ -1090,6 +1092,16 @@
         if (!matched && custom) custom.value = value || '';
         profSelChange(hiddenId);
       });
+    }
+    function kaProfileSlotChange() {
+      var slot = selectedSlot('kaSlot'); if (slot == null) return;
+      var hidden = document.getElementById('kaProfile');
+      profInit('kaProfile', hidden ? hidden.value : '', slot);
+    }
+    function stProfileSlotChange(i) {
+      var slot = selectedSlot('st' + i + 'Slot'); if (slot == null) return;
+      var hidden = document.getElementById('st' + i + 'Prof');
+      profInit('st' + i + 'Prof', hidden ? hidden.value : '', slot);
     }
 
     // ---- 自定义定时任务（复用推送通道卡片样式） ----
@@ -1113,7 +1125,7 @@
             '<div class="form-group"><label>周期（天）</label><input type="number" name="st' + i + 'Days" id="st' + i + 'Days" min="1" max="3650" value="30"></div>' +
           '</div>' +
           '<div class="form-row">' +
-            '<div class="form-group"><label>目标卡槽</label><select name="st' + i + 'Slot" id="st' + i + 'Slot"><option value="0">卡槽 1</option><option value="1">卡槽 2</option></select></div>' +
+            '<div class="form-group"><label>目标卡槽</label><select name="st' + i + 'Slot" id="st' + i + 'Slot" onchange="stProfileSlotChange(' + i + ')"><option value="0">卡槽 1</option><option value="1">卡槽 2</option></select></div>' +
             '<div class="form-group"><label>动作</label><select name="st' + i + 'Act" id="st' + i + 'Act"><option value="0">推送自定义提醒</option><option value="1">蜂窝 HTTP 下载(ping)</option><option value="2">发送短信</option><option value="3">USSD 查询</option></select></div>' +
           '</div>' +
           '<div class="form-row">' +
@@ -1147,7 +1159,7 @@
         var el = document.getElementById('stTask' + i);
         if (el && el.style.display === 'none') {
           var en = document.getElementById('st' + i + 'En'); if (en) en.checked = true;
-          profInit('st' + i + 'Prof', '');
+          profInit('st' + i + 'Prof', '', selectedSlot('st' + i + 'Slot') || 0);
           stShow(i, true);
           stSyncHead(i);
           return;
@@ -1199,7 +1211,7 @@
             stSetVal('st' + i + 'Slot', t.slot);
             stSetVal('st' + i + 'Act', t.action);
             stSetVal('st' + i + 'Tgt', t.target); stSetVal('st' + i + 'Pay', t.payload);
-            profInit('st' + i + 'Prof', t.profile || '');
+            profInit('st' + i + 'Prof', t.profile || '', Number(t.slot));
             stShow(i, stCardUsed(t));
             stSyncHead(i);
           }
@@ -1671,7 +1683,7 @@
       host.textContent = d.installHost || '--';
       matching.textContent = d.installMatchingIdMasked || '--';
       var busy = !!(d.jobQueued || d.jobRunning);
-      var active = busy && d.action === 'install-start';
+      var active = busy && d.action === 'install-start' && Number(d.jobSlot) === Number(d.slot);
       var waitingConfirmation = active && d.installPhase === 'waiting_confirmation';
       start.disabled = busy;
       if (confirmationBox && confirmationInput && confirmationSubmit) {
@@ -1687,7 +1699,7 @@
         status.textContent = d.jobMessage;
       } else if (busy) {
         status.className = 'result-box result-loading';
-        status.textContent = d.jobMessage || '其它 eSIM 任务执行中';
+        status.textContent = d.jobMessage || ('卡槽 ' + (Number(d.jobSlot) + 1) + ' 的 eSIM 任务执行中');
       } else if (!busy && (!d.action || d.action !== 'install-start')) {
         status.className = 'result-box result-info';
         status.textContent = '尚未提交下载任务';
@@ -1706,7 +1718,7 @@
       if (!tbody) return;
       tbody.innerHTML = '';
       var profiles = Array.isArray(d.profiles) ? d.profiles : [];
-      esimOptions = profileOptionsFromProfiles(profiles);
+      esimOptions[Number(d.slot)] = profileOptionsFromProfiles(profiles);
       if (!profiles.length) {
         var empty = document.createElement('tr');
         var cell = document.createElement('td');
@@ -1749,8 +1761,10 @@
       }
     }
     function esimLoadStatus(polling) {
-      fetch('/esim?action=status&_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(d) {
+      var slot = selectedSlot('simSlot'); if (slot == null) return;
+      fetch('/esim?action=status&slot=' + slot + '&_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(d) {
         if (!panelActive('sim')) return;
+        if (selectedSlot('simSlot') !== slot) return;
         d = d || {};
         esimRender(d);
         // 仅在主动跟踪任务(polling)时弹 toast，被动打开面板不因历史已完成任务误弹旧消息
@@ -1769,13 +1783,15 @@
       });
     }
     function esimStart(action, body) {
+      var slot = selectedSlot('simSlot'); if (slot == null) return;
       showToast('正在提交 eSIM 任务…', 'loading');
-      csrfFetch('/esim?action=' + encodeURIComponent(action), {method:'POST', cache:'no-store', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:body || ''}).then(jsonOrThrow).then(function(d) {
+      csrfFetch('/esim?action=' + encodeURIComponent(action) + '&slot=' + slot, {method:'POST', cache:'no-store', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:body || ''}).then(jsonOrThrow).then(function(d) {
         if (d.success && d.queued) { showToast(d.message || 'eSIM 任务已排队', 'loading'); esimLoadStatus(true); }
         else { showToast(d.message || 'eSIM 任务启动失败', 'err'); }
       }).catch(function(e){ showToast('请求失败: ' + e, 'err'); });
     }
     function esimInstallStart() {
+      var slot = selectedSlot('simSlot'); if (slot == null) return;
       var input = document.getElementById('esimActivationCode');
       var start = document.getElementById('esimInstallStartBtn');
       var compat = document.getElementById('esimEs9CompatMode');
@@ -1785,7 +1801,7 @@
       }
       if (start) start.disabled = true;
       showToast('正在提交 eSIM 下载任务…', 'loading');
-      csrfFetch('/esim?action=install-start', {
+      csrfFetch('/esim?action=install-start&slot=' + slot, {
         method: 'POST', cache: 'no-store',
         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
         body: 'activationCode=' + encodeURIComponent(input.value.trim()) +
@@ -1805,6 +1821,7 @@
       });
     }
     function esimInstallSubmitConfirmation() {
+      var slot = selectedSlot('simSlot'); if (slot == null) return;
       var input = document.getElementById('esimConfirmationCode');
       var submit = document.getElementById('esimConfirmationSubmitBtn');
       if (!input || !input.value.trim()) {
@@ -1812,7 +1829,7 @@
         return;
       }
       if (submit) submit.disabled = true;
-      csrfFetch('/esim?action=install-confirmation-code', {
+      csrfFetch('/esim?action=install-confirmation-code&slot=' + slot, {
         method: 'POST', cache: 'no-store',
         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
         body: 'confirmationCode=' + encodeURIComponent(input.value)

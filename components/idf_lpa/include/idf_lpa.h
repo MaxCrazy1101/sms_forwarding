@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include <string>
 
@@ -41,7 +42,8 @@ struct LpaAuthenticationResult {
 // 执行 SGP.22 v2.7 的 InitiateAuthentication、AuthenticateServer、AuthenticateClient。
 // 成功只表示服务器认证链完成，不表示 Profile 已下载或写入 eUICC。
 // 认证对象、transactionId 和证书均只在函数生命周期内存在于 RAM。
-esp_err_t idf_lpa_run_authentication(const LpaActivationCode& activation_code,
+esp_err_t idf_lpa_run_authentication(uint8_t slot,
+                                     const LpaActivationCode& activation_code,
                                      LpaAuthenticationResult& result,
                                      std::string& safe_message);
 
@@ -68,7 +70,8 @@ struct LpaDownloadStats {
 
 // 成功表示 Profile 已通过 LoadBoundProfilePackage、HandleNotification 和
 // RemoveNotificationFromList；不表示已自动启用。所有敏感字段只在本次调用中存在。
-esp_err_t idf_lpa_run_profile_download(const LpaActivationCode& activation_code,
+esp_err_t idf_lpa_run_profile_download(uint8_t slot,
+                                       const LpaActivationCode& activation_code,
                                        const LpaDownloadObserver& observer,
                                        LpaDownloadStats& stats,
                                        std::string& safe_message);
