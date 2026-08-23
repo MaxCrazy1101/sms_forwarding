@@ -835,11 +835,11 @@ static bool try_unlock_sim(bool allow_puk)
     send_ok("AT+CMEE=1", 1200);
     std::string state = query_sim_state();
     if (state == "ready") {
-        set_sim_status("ready", false, "SIM 已就绪");
+        set_sim_status("ready", false, {});
         return true;
     }
     if (state != "pin" && state != "puk") {
-        set_sim_status(state, false, state == "absent" ? "未检测到 SIM" : "无法自动处理该 SIM 状态");
+        set_sim_status(state, false, state == "absent" ? "" : "无法自动处理该 SIM 状态");
         return false;
     }
     if (allow_puk && state != "puk") {
@@ -2490,10 +2490,10 @@ static void modem_task(void*)
                     sms_reconfigure_pending = true;
                     sim_ready = false;
                     idf_modem_invalidate_sim_identity();
-                    set_sim_status("absent", false, "未检测到 SIM");
+                    set_sim_status("absent", false, {});
                     set_phase("registering");
                 } else if (previous_present == -1 && present_now == 0 && !sim_ready) {
-                    set_sim_status("absent", false, "未检测到 SIM");
+                    set_sim_status("absent", false, {});
                 } else if (!sim_ready && present_now == 1 &&
                            (previous_present == -1 || sim_state_now == "ready")) {
                     if (sim_state_now == "ready") {
