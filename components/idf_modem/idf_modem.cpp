@@ -2483,17 +2483,20 @@ static void modem_task(void*)
                     dereg_count = 0;
                     sms_reconfigure_pending = true;
                     idf_modem_request_reset(true);
-                } else if (previous_present == 1 && present_now == 0) {
-                    idf_log_line("检测到 SIM 卡移除");
-                    registered = false;
-                    post_register_done = false;
-                    sms_reconfigure_pending = true;
-                    sim_ready = false;
-                    idf_modem_invalidate_sim_identity();
-                    set_sim_status("absent", false, {});
-                    set_phase("registering");
-                } else if (previous_present == -1 && present_now == 0 && !sim_ready) {
-                    set_sim_status("absent", false, {});
+                } else if (present_now == 0 && previous_present != 0) {
+                    if (previous_present == -1 && !sim_ready) {
+                        set_sim_status("absent", false, {});
+                    } else {
+                        // sim_ready 已证明此前 CPIN=READY；即使尚未建立在位基线，首次 absent 也是拔卡。
+                        idf_log_line("检测到 SIM 卡移除");
+                        registered = false;
+                        post_register_done = false;
+                        sms_reconfigure_pending = true;
+                        sim_ready = false;
+                        idf_modem_invalidate_sim_identity();
+                        set_sim_status("absent", false, {});
+                        set_phase("registering");
+                    }
                 } else if (!sim_ready && present_now == 1 &&
                            (previous_present == -1 || sim_state_now == "ready")) {
                     if (sim_state_now == "ready") {
