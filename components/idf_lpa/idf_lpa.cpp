@@ -635,6 +635,63 @@ static bool json_get_string(const std::string& json,
     return required ? count == 1U : count <= 1U;
 }
 
+static bool valid_status_code_token(const std::string& value)
+{
+    if (value.empty() || value.size() > 32U) return false;
+    bool need_digit = true;
+    for (char ch : value) {
+        if (ch == '.') {
+            if (need_digit) return false;
+            need_digit = true;
+        } else if (ch >= '0' && ch <= '9') {
+            need_digit = false;
+        } else {
+            return false;
+        }
+    }
+    return !need_digit;
+}
+
+static bool json_get_status_code(const std::string& json,
+                                 const char* key,
+                                 std::string& out)
+{
+    out.clear();
+    if (!json_get_string(json, key, out, false) ||
+        !valid_status_code_token(out)) {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+static const char* safe_es9_status_for_log(const std::string& status)
+{
+    if (status == "Failed") return "Failed";
+    if (status == "Expired") return "Expired";
+    if (status == "Executed-WithWarning") return "Executed-WithWarning";
+    if (status == "Executed-Success") return "Executed-Success";
+    return "other";
+}
+
+static const char* status_code_for_log(const std::string& value)
+{
+    return valid_status_code_token(value) ? value.c_str() :
+           (value.empty() ? "missing" : "invalid");
+}
+
+static void log_es9_failure_status(const char* operation,
+                                   const std::string& status,
+                                   const std::string& subject_code,
+                                   const std::string& reason_code)
+{
+    idf_logf("ES9+ %s status=%s subjectCode=%s reasonCode=%s",
+             operation ? operation : "请求",
+             safe_es9_status_for_log(status),
+             status_code_for_log(subject_code),
+             status_code_for_log(reason_code));
+}
+
 static bool base64_text_valid(const std::string& text)
 {
     if (text.empty() || (text.size() % 4U) != 0U) return false;
@@ -941,14 +998,23 @@ static bool build_authenticate_server_request(const LpaActivationCode& activatio
     return true;
 }
 
-static bool parse_success_status(const std::string& json, std::string& message)
+static bool parse_success_status(const std::string& json,
+                                 const char* operation,
+                                 std::string& message)
 {
     SensitiveText status;
     if (!json_get_string(json, "status", status.text, true)) {
+        log_es9_failure_status(operation, "", "", "");
         message = "ES9+ 响应缺少 functionExecutionStatus";
         return false;
     }
     if (status.text != "Executed-Success") {
+        SensitiveText subject_code;
+        SensitiveText reason_code;
+        json_get_status_code(json, "subjectCode", subject_code.text);
+        json_get_status_code(json, "reasonCode", reason_code.text);
+        log_es9_failure_status(operation, status.text,
+                                subject_code.text, reason_code.text);
         // 服务器 status 用于定位协议阶段；不回显服务端 message 或原始响应。
         message = "ES9+ 服务器拒绝请求（";
         message += status.text;
@@ -1161,7 +1227,7 @@ static esp_err_t run_authentication_session(const LpaActivationCode& activation_
                         initiate_response.text,
                         safe_message);
     if (err != ESP_OK) return err;
-    if (!parse_success_status(initiate_response.text, safe_message)) {
+    if (!parse_success_status(initiate_response.text, "InitiateAuthentication", safe_message)) {
         return ESP_ERR_INVALID_RESPONSE;
     }
 
@@ -1262,7 +1328,7 @@ static esp_err_t run_authentication_session(const LpaActivationCode& activation_
                         authenticate_client_response.text,
                         safe_message);
     if (err != ESP_OK) return err;
-    if (!parse_success_status(authenticate_client_response.text, safe_message)) {
+    if (!parse_success_status(authenticate_client_response.text, "AuthenticateClient", safe_message)) {
         return ESP_ERR_INVALID_RESPONSE;
     }
     SensitiveText response_transaction_text;
@@ -2123,6 +2189,12 @@ public:
         // 根据 status 生成业务错误，不能把它误判成 Base64/DER 错误。
         if (status_ != "Executed-Success") return ESP_OK;
         if (!bpp_seen_) return fail("ES9+ BPP 响应缺少 boundProfilePackage");
+        // 兼容实际 SM-DP+ 的 BPP-first 顺序：BPP 已经流式写入后，
+        // 在结束响应扫描时核对 status/transactionId；失败不能回滚已写卡数据。
+        if (bpp_first_unvalidated_) {
+            esp_err_t metadata_err = validate_bpp_metadata();
+            if (metadata_err != ESP_OK) return metadata_err;
+        }
         esp_err_t err = decoder_.finish(message_);
         if (err != ESP_OK) {
             failure_stage_ = "base64";
@@ -2134,6 +2206,8 @@ public:
     }
 
     const std::string& status() const { return status_; }
+    const std::string& subject_code() const { return subject_code_; }
+    const std::string& reason_code() const { return reason_code_; }
     const std::string& transaction_id() const { return transaction_id_.text; }
     size_t encoded_bpp_chars() const { return decoder_.encoded_chars(); }
     size_t decoded_bpp_bytes() const { return parser_.decoded_bytes(); }
@@ -2144,6 +2218,19 @@ public:
     const std::vector<uint8_t>& parser_failure_header() const { return parser_.failure_header(); }
     bool status_seen() const { return status_seen_; }
     bool bpp_seen() const { return bpp_seen_; }
+    uint8_t metadata_key_mask() const { return metadata_key_mask_; }
+    bool bpp_first_unvalidated() const { return bpp_first_unvalidated_; }
+
+    const char* metadata_state() const
+    {
+        if (bpp_first_unvalidated_) return "bpp-first-unvalidated";
+        if (bpp_started_ && !status_seen_ && !transaction_seen_) return "bpp-first";
+        if (bpp_started_ && status_seen_ && !transaction_seen_) return "status-first";
+        if (bpp_started_ && !status_seen_ && transaction_seen_) return "transaction-first";
+        if (bpp_started_) return "metadata-before-bpp";
+        if (metadata_key_mask_ != 0U) return "metadata-without-bpp";
+        return "none";
+    }
 
 private:
     enum class StringRole { none, token, value };
@@ -2165,7 +2252,8 @@ private:
                     return fail("ES9+ BPP Base64 不允许 JSON escape");
                 }
                 if (role_ == StringRole::value &&
-                    (current_key_ == "status" || current_key_ == "transactionId")) {
+                    (current_key_ == "status" || current_key_ == "transactionId" ||
+                     current_key_ == "subjectCode" || current_key_ == "reasonCode")) {
                     if (!append_small(static_cast<char>(ch))) return fail("ES9+ BPP 字段过长");
                 }
                 return ESP_OK;
@@ -2191,7 +2279,7 @@ private:
                 token_.push_back(ch);
             } else if (role_ == StringRole::value) {
                 if (current_key_ == "boundProfilePackage") {
-                    if (!bpp_metadata_validated_) {
+                    if (!bpp_first_unvalidated_ && !bpp_metadata_validated_) {
                         esp_err_t metadata_err = validate_bpp_metadata();
                         if (metadata_err != ESP_OK) return metadata_err;
                     }
@@ -2201,7 +2289,8 @@ private:
                         failure_stage_ = parser_.input_bytes() != decoded_before ? "der" : "base64";
                         return err;
                     }
-                } else if (current_key_ == "status" || current_key_ == "transactionId") {
+                } else if (current_key_ == "status" || current_key_ == "transactionId" ||
+                           current_key_ == "subjectCode" || current_key_ == "reasonCode") {
                     if (!append_small(ch)) return fail("ES9+ BPP 字段过长");
                 }
             }
@@ -2212,12 +2301,14 @@ private:
             if (isspace(static_cast<unsigned char>(ch))) return ESP_OK;
             awaiting_value_ = false;
             if (ch == '"') {
+                mark_metadata_key();
                 in_string_ = true;
                 role_ = StringRole::value;
                 escape_ = false;
                 value_.clear();
                 return ESP_OK;
             }
+            mark_metadata_key();
             current_key_.clear();
             return ESP_OK;
         }
@@ -2240,6 +2331,22 @@ private:
         return ESP_OK;
     }
 
+    void mark_metadata_key()
+    {
+        if (current_key_ == "status") {
+            metadata_key_mask_ |= 0x01U;
+        } else if (current_key_ == "transactionId") {
+            metadata_key_mask_ |= 0x02U;
+        } else if (current_key_ == "boundProfilePackage") {
+            const bool metadata_before_bpp = (metadata_key_mask_ & 0x03U) != 0U;
+            metadata_key_mask_ |= 0x04U;
+            bpp_started_ = true;
+            // 实际服务端采用 BPP-first；只有 status/transactionId 都先出现时，
+            // 才在首个 BPP 字符前校验 metadata。
+            bpp_first_unvalidated_ = !metadata_before_bpp;
+        }
+    }
+
     bool append_small(char ch)
     {
         if (value_.size() >= 128U) return false;
@@ -2253,6 +2360,12 @@ private:
             if (status_seen_) return fail("ES9+ BPP functionExecutionStatus 重复");
             status_ = value_;
             status_seen_ = true;
+        } else if (current_key_ == "subjectCode") {
+            if (!subject_code_.empty()) return fail("ES9+ BPP subjectCode 重复");
+            subject_code_ = value_;
+        } else if (current_key_ == "reasonCode") {
+            if (!reason_code_.empty()) return fail("ES9+ BPP reasonCode 重复");
+            reason_code_ = value_;
         } else if (current_key_ == "transactionId") {
             if (transaction_seen_) return fail("ES9+ BPP transactionId 重复");
             clear_string(transaction_id_.text);
@@ -2297,6 +2410,8 @@ private:
     std::string current_key_;
     std::string value_;
     std::string status_;
+    std::string subject_code_;
+    std::string reason_code_;
     SensitiveText transaction_id_;
     SensitiveText expected_transaction_id_;
     const char* failure_stage_ = "none";
@@ -2308,6 +2423,9 @@ private:
     bool transaction_seen_ = false;
     bool bpp_seen_ = false;
     bool bpp_metadata_validated_ = false;
+    uint8_t metadata_key_mask_ = 0;
+    bool bpp_started_ = false;
+    bool bpp_first_unvalidated_ = false;
     StringRole role_ = StringRole::none;
 };
 
@@ -2389,17 +2507,20 @@ static esp_err_t es9_bpp_http_event_handler(esp_http_client_event_t* event)
             }
             if (capture->scannerError != ESP_OK && capture->scannerError != ESP_ERR_TIMEOUT) {
                 // 只记录有界的阶段、偏移、状态和当前 TLV header，便于定位流式解析错位。
-                idf_logf("ES9+ BPP parser: stage=%s err=%s/0x%08X httpBytes=%u b64Chars=%u derBytes=%u derOffset=%u state=%s header=%s segments=%u",
+                idf_logf("ES9+ BPP parser: stage=%s err=%s/0x%08X httpBytes=%u b64Chars=%u bppFirst=%d derBytes=%u derOffset=%u state=%s header=%s segments=%u metadata=%s keyMask=0x%02X",
                          capture->scanner->failure_stage(),
                          esp_err_to_name(capture->scannerError),
                          static_cast<unsigned>(capture->scannerError),
                          static_cast<unsigned>(capture->responseBytes),
                          static_cast<unsigned>(capture->scanner->encoded_bpp_chars()),
+                         capture->scanner->bpp_first_unvalidated() ? 1 : 0,
                          static_cast<unsigned>(capture->scanner->decoded_bpp_bytes()),
                          static_cast<unsigned>(capture->scanner->parser_failure_offset()),
                          capture->scanner->parser_failure_state(),
                          bpp_header_summary(capture->scanner->parser_failure_header()).c_str(),
-                         static_cast<unsigned>(capture->scanner->segment_count()));
+                         static_cast<unsigned>(capture->scanner->segment_count()),
+                         capture->scanner->metadata_state(),
+                         static_cast<unsigned>(capture->scanner->metadata_key_mask()));
                 if (capture->scannerMessage->empty()) {
                     char detail[128];
                     snprintf(detail, sizeof(detail),
@@ -2477,14 +2598,17 @@ static esp_err_t es9_post_json_bpp(const std::string& host,
     const char* status_state = !scanner.status_seen()
         ? "missing"
         : (scanner.status() == "Executed-Success" ? "success" : "non-success");
-    idf_logf("ES9+ GetBPP: HTTP=%d err=%s/0x%08X httpBytes=%u scannerErr=%s/0x%08X status=%s bpp=%d b64Chars=%u derBytes=%u segments=%u protocol=%s",
+    idf_logf("ES9+ GetBPP: HTTP=%d err=%s/0x%08X httpBytes=%u scannerErr=%s/0x%08X status=%s bpp=%d b64Chars=%u bppFirst=%d derBytes=%u segments=%u metadata=%s keyMask=0x%02X protocol=%s",
              status_code, esp_err_to_name(err), static_cast<unsigned>(err),
              static_cast<unsigned>(capture.responseBytes),
              esp_err_to_name(capture.scannerError), static_cast<unsigned>(capture.scannerError),
              status_state, scanner.bpp_seen() ? 1 : 0,
              static_cast<unsigned>(scanner.encoded_bpp_chars()),
+             scanner.bpp_first_unvalidated() ? 1 : 0,
              static_cast<unsigned>(scanner.decoded_bpp_bytes()),
              static_cast<unsigned>(scanner.segment_count()),
+             scanner.metadata_state(),
+             static_cast<unsigned>(scanner.metadata_key_mask()),
              rsp_protocol_state(capture.adminProtocol, capture.adminProtocolSeen));
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
@@ -2508,8 +2632,18 @@ static esp_err_t es9_post_json_bpp(const std::string& host,
         return ESP_ERR_INVALID_RESPONSE;
     }
     err = scanner.finish();
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        idf_logf("ES9+ GetBPP finish: err=%s/0x%08X status=%s metadata=%s keyMask=0x%02X bppFirst=%d",
+                 esp_err_to_name(err), static_cast<unsigned>(err),
+                 scanner.status_seen() ? scanner.status().c_str() : "missing",
+                 scanner.metadata_state(),
+                 static_cast<unsigned>(scanner.metadata_key_mask()),
+                 scanner.bpp_first_unvalidated() ? 1 : 0);
+        return err;
+    }
     if (scanner.status() != "Executed-Success") {
+        log_es9_failure_status("GetBPP", scanner.status(),
+                               scanner.subject_code(), scanner.reason_code());
         message = "ES9+ 服务器拒绝请求（";
         message += scanner.status();
         message += "）";
@@ -2858,7 +2992,8 @@ static esp_err_t es9_post_notification(const std::string& host,
     if (err != ESP_OK) {
         return err;
     }
-    if (!response.text.empty() && !parse_success_status(response.text, message)) {
+    if (!response.text.empty() &&
+        !parse_success_status(response.text, "HandleNotification", message)) {
         return ESP_ERR_INVALID_RESPONSE;
     }
     return ESP_OK;
