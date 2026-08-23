@@ -62,8 +62,8 @@ def minify_markup(text: str) -> str:
 
 
 def minify_js(text: str) -> str:
-    # 保守处理：不删 // 注释，避免误伤字符串里的 URL；gzip 会吃掉大部分重复空白。
-    lines = [line.rstrip() for line in text.splitlines()]
+    # 只删整行注释：不会误伤字符串中的 https://，也不需要引入 JS parser。
+    lines = [line.rstrip() for line in text.splitlines() if not re.match(r"^\s*//", line)]
     return "\n".join(line for line in lines if line.strip())
 
 

@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <functional>
 #include <new>
 #include <string>
 #include <vector>
@@ -34,6 +33,7 @@ static constexpr size_t OUT_SMS_QUEUE_MAX = 3;
 static constexpr size_t SEEN_RING_MAX = 32;
 static constexpr size_t CONCAT_SLOTS = 5;
 static constexpr size_t CONCAT_PARTS = 10;
+static_assert(CONCAT_PARTS <= 16, "receivedMask 只能记录最多 16 个长短信分段");
 // 30s(Arduino 原值)在真实网络下太短：SIM 满被拒收的分段要等 SMSC 按分钟级
 // 间隔重投，+CMTI 丢失时也要等轮询兜底，30s 一到就强拼出"[缺失分段]"残句。
 // 直投仍可能遇到运营商分钟级重投，等待 15 分钟再带缺段标记转发。
@@ -50,16 +50,16 @@ static constexpr uint8_t SMS_CNMI_REASSERT_EVERY = 5;
 static constexpr uint32_t SMS_SUBMIT_TIMEOUT_MS = 60000;
 
 struct ConcatPart {
-    bool valid = false;
     std::string text;
-    std::string timestamp;
+    uint32_t fingerprint = 0;
 };
 
 struct ConcatSlot {
+    uint16_t ref = 0;
+    uint16_t receivedMask = 0;
+    uint8_t total = 0;
+    uint8_t received = 0;
     bool active = false;
-    int ref = 0;
-    int total = 0;
-    int received = 0;
     std::string sender;
     std::string timestamp;
     int64_t lastUs = 0;
@@ -80,12 +80,10 @@ struct DecodedSms {
 
 // 已成功合并的长短信登记环：SIM 满时部分分段被拒收，SMSC 会整条重投(同 ref)。
 struct ConcatDone {
+    uint16_t ref = 0;
+    uint8_t total = 0;
     bool used = false;
-    int ref = 0;
-    int total = 0;
-    std::string sender;
-    std::array<uint32_t, CONCAT_PARTS> partHash = {};
-    std::array<std::string, CONCAT_PARTS> partTimestamp;
+    std::array<uint32_t, CONCAT_PARTS> partFingerprint = {};
     int64_t doneUs = 0;
 };
 
@@ -125,13 +123,23 @@ struct SmsContext {
 
 static SemaphoreHandle_t s_pdu_mutex = nullptr;
 static PDU s_pdu(4096);
-static std::array<SmsContext, IDF_MODEM_SLOT_COUNT> s_sms;
+alignas(SmsContext) static unsigned char s_sms_storage[sizeof(SmsContext) * IDF_MODEM_SLOT_COUNT];
+static SmsContext* s_sms = nullptr;
 static std::atomic<bool> s_admin_reset_pending{false};
 
 static SmsContext* context_for_slot(uint8_t slot)
 {
-    if (!idf_modem_slot_valid(slot)) return nullptr;
+    if (!s_sms || !idf_modem_slot_valid(slot)) return nullptr;
     return &s_sms[slot];
+}
+
+void idf_sms_init()
+{
+    if (s_sms) return;
+    s_sms = reinterpret_cast<SmsContext*>(s_sms_storage);
+    for (uint8_t slot = 0; slot < IDF_MODEM_SLOT_COUNT; ++slot) {
+        new (&s_sms[slot]) SmsContext;
+    }
 }
 
 static void cleanup_start_resources(SmsContext& ctx)
@@ -175,10 +183,34 @@ static bool is_hex_string(const std::string& line)
     return true;
 }
 
-// 仅供本次开机内的去重环使用，不要求跨重启稳定，直接用标准库哈希
-static uint32_t hash32(const std::string& text)
+// 仅供本次开机内的去重环使用，不要求跨重启稳定。逐字段混入长度和正文，既保留字段边界，
+// 也避免为了计算 slot/sender/time/text 组合键而临时拼接一个大字符串。
+static uint32_t fingerprint_add(uint32_t hash, const std::string& text)
 {
-    return static_cast<uint32_t>(std::hash<std::string>{}(text));
+    hash ^= static_cast<uint32_t>(text.size());
+    hash *= 16777619U;
+    for (unsigned char ch : text) {
+        hash ^= ch;
+        hash *= 16777619U;
+    }
+    return hash;
+}
+
+static uint32_t sms_fingerprint(uint8_t slot, const std::string& sender,
+                                const std::string& timestamp, const std::string& text)
+{
+    uint32_t hash = (2166136261U ^ slot) * 16777619U;
+    hash = fingerprint_add(hash, sender);
+    hash = fingerprint_add(hash, timestamp);
+    return fingerprint_add(hash, text);
+}
+
+static uint32_t concat_part_fingerprint(const std::string& sender, const std::string& text,
+                                        const std::string& timestamp)
+{
+    uint32_t hash = fingerprint_add(2166136261U, sender);
+    hash = fingerprint_add(hash, text);
+    return fingerprint_add(hash, timestamp);
 }
 
 static bool seen_recently(SmsContext& ctx, uint32_t hash)
@@ -451,15 +483,15 @@ static void clear_concat_slot(ConcatSlot& slot)
 {
     slot.active = false;
     slot.ref = 0;
+    slot.receivedMask = 0;
     slot.total = 0;
     slot.received = 0;
     slot.sender.clear();
     slot.timestamp.clear();
     slot.lastUs = 0;
     for (auto& part : slot.parts) {
-        part.valid = false;
         part.text.clear();
-        part.timestamp.clear();
+        part.fingerprint = 0;
     }
 }
 
@@ -467,12 +499,14 @@ static std::string assemble_concat(const ConcatSlot& slot)
 {
     std::string text;
     for (int i = 0; i < slot.total && i < static_cast<int>(CONCAT_PARTS); ++i) {
-        if (slot.parts[i].valid) {
+        if ((slot.receivedMask & (1U << i)) != 0) {
             text += slot.parts[i].text;
         } else {
             // 超时强制合并时标记缺口，收件人能看出内容不完整(对齐 Arduino)
             text += "[缺失分段";
-            text += std::to_string(i + 1);
+            unsigned number = static_cast<unsigned>(i + 1);
+            if (number >= 10) text.push_back(static_cast<char>('0' + number / 10));
+            text.push_back(static_cast<char>('0' + number % 10));
             text += "]";
         }
     }
@@ -484,7 +518,7 @@ static void process_sms_content(SmsContext& ctx, const char* sender_raw, const c
 
 // 已成功合并的长短信登记环：SIM 满时部分分段被拒收，SMSC 会整条重投(同 ref)。
 // 槽位合并完成后迟到的重复分段若不识别，会重新开槽并在超时后拼出一条
-// "[缺失分段]"幽灵消息。按 (ref,发件人,总段数,分段内容哈希) 精确匹配才丢弃，
+// "[缺失分段]"幽灵消息。按 (ref,总段数,发件人/正文/时间戳指纹) 组合匹配才丢弃，
 // 避免运营商短期复用 ref 时误杀真实新消息。
 static constexpr int64_t CONCAT_DONE_TTL_US = 10LL * 60 * 1000 * 1000;
 
@@ -492,10 +526,10 @@ static bool concat_recently_done(SmsContext& ctx, int ref, const std::string& se
                                  int part, const std::string& text, const std::string& timestamp)
 {
     int64_t now = esp_timer_get_time();
+    uint32_t fingerprint = concat_part_fingerprint(sender, text, timestamp);
     for (const auto& d : ctx.concatDone) {
         if (!d.used || now - d.doneUs > CONCAT_DONE_TTL_US) continue;
-        if (d.ref == ref && d.total == total && d.sender == sender &&
-            d.partHash[part - 1] == hash32(text) && d.partTimestamp[part - 1] == timestamp) {
+        if (d.ref == ref && d.total == total && d.partFingerprint[part - 1] == fingerprint) {
             return true;
         }
     }
@@ -509,13 +543,10 @@ static void record_concat_done(SmsContext& ctx, const ConcatSlot& slot)
     d.used = true;
     d.ref = slot.ref;
     d.total = slot.total;
-    d.sender = slot.sender;
-    d.partHash.fill(0);
-    for (auto& timestamp : d.partTimestamp) timestamp.clear();
+    d.partFingerprint.fill(0);
     for (int i = 0; i < slot.total && i < static_cast<int>(CONCAT_PARTS); ++i) {
-        if (slot.parts[i].valid) {
-            d.partHash[i] = hash32(slot.parts[i].text);
-            d.partTimestamp[i] = slot.parts[i].timestamp;
+        if ((slot.receivedMask & (1U << i)) != 0) {
+            d.partFingerprint[i] = slot.parts[i].fingerprint;
         }
     }
     d.doneUs = esp_timer_get_time();
@@ -574,7 +605,7 @@ static void process_sms_content(SmsContext& ctx, const char* sender_raw, const c
 
     // 去重键用 PDU 原始时间戳(双通道 URC+CMGL 收到的是同一原始值)；
     // 展示/转发用本地可读时间，未同步时才退回原始数字串
-    uint32_t hash = hash32(std::to_string(ctx.slot) + "|" + sender + "|" + timestamp + "|" + text);
+    uint32_t hash = sms_fingerprint(ctx.slot, sender, timestamp, text);
     if (seen_recently(ctx, hash)) {
         idf_logf("slot=%u 重复短信 %s 已忽略", ctx.slot, sender.c_str());
         return;
@@ -626,7 +657,9 @@ static void handle_decoded_pdu(SmsContext& ctx, const DecodedSms& sms)
         }
         ConcatSlot& concat_slot = find_concat_slot(ctx, ref, sender ? sender : "", total);
         int idx = part - 1;
-        if (concat_slot.parts[idx].valid && concat_slot.parts[idx].text != (text ? text : "")) {
+        uint16_t part_mask = static_cast<uint16_t>(1U << idx);
+        if ((concat_slot.receivedMask & part_mask) != 0 &&
+            concat_slot.parts[idx].text != (text ? text : "")) {
             // 8 位引用号可能被运营商快速复用；同一分段号正文已变化时不能继续混拼旧消息。
             idf_logf("slot=%u 长短信引用号 ref=%d 已复用，丢弃旧的不完整 %d/%d 段并重新归组",
                      ctx.slot, ref, concat_slot.received, concat_slot.total);
@@ -637,10 +670,11 @@ static void handle_decoded_pdu(SmsContext& ctx, const DecodedSms& sms)
             concat_slot.sender = sender ? sender : "";
             concat_slot.lastUs = esp_timer_get_time();
         }
-        if (!concat_slot.parts[idx].valid) {
-            concat_slot.parts[idx].valid = true;
+        if ((concat_slot.receivedMask & part_mask) == 0) {
+            concat_slot.receivedMask |= part_mask;
             concat_slot.parts[idx].text = text ? text : "";
-            concat_slot.parts[idx].timestamp = ts ? ts : "";
+            concat_slot.parts[idx].fingerprint = concat_part_fingerprint(
+                concat_slot.sender, concat_slot.parts[idx].text, ts ? ts : "");
             concat_slot.received++;
             concat_slot.lastUs = esp_timer_get_time();
             if (concat_slot.timestamp.empty()) concat_slot.timestamp = ts ? ts : "";
@@ -1086,7 +1120,7 @@ static void sms_task(void* raw)
             continue;
         }
 
-        IdfModemStatus modem = idf_modem_get_status(ctx.slot);
+        IdfModemReadiness modem = idf_modem_get_readiness(ctx.slot);
         if (modem.atReady && !configured) {
             std::string ignored;
             idf_modem_send_at(ctx.slot, "AT+CSMS=1", 1200, ignored);
@@ -1313,7 +1347,7 @@ esp_err_t idf_sms_send_text(uint8_t slot, const std::string& phone_raw, const st
         message = "号码或内容无效";
         return ESP_ERR_INVALID_ARG;
     }
-    IdfModemStatus modem = idf_modem_get_status(slot);
+    IdfModemReadiness modem = idf_modem_get_readiness(slot);
     if (!modem.modemReady) {
         message = "模组尚未注册网络";
         return ESP_ERR_INVALID_STATE;

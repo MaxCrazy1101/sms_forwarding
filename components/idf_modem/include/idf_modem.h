@@ -5,7 +5,6 @@
 #include <string>
 
 #include "esp_err.h"
-#include "idf_config.h"
 
 struct IdfModemStatus {
     bool started = false;
@@ -36,6 +35,11 @@ struct IdfModemStatus {
     std::string simUnlockMessage;
 };
 
+struct IdfModemReadiness {
+    bool atReady = false;
+    bool modemReady = false;
+};
+
 struct IdfCellularHttpResult {
     bool ok = false;
     int httpStatus = -1;
@@ -58,7 +62,7 @@ constexpr bool idf_modem_slot_valid(uint8_t slot)
     return slot < IDF_MODEM_SLOT_COUNT;
 }
 
-esp_err_t idf_modem_start(uint8_t slot, const IdfConfig& config);
+esp_err_t idf_modem_start(uint8_t slot);
 esp_err_t idf_modem_send_at(uint8_t slot, const std::string& cmd, uint32_t timeout_ms,
                             std::string& response);
 esp_err_t idf_modem_send_at_until(uint8_t slot, const std::string& cmd, const char* token,
@@ -81,6 +85,9 @@ bool idf_modem_wait_event(uint8_t slot, uint32_t timeout_ms);
 // 唤醒等待者(短信任务)：URC 入缓冲、网页短信入队等场景调用
 void idf_modem_signal_event(uint8_t slot);
 IdfModemStatus idf_modem_get_status(uint8_t slot);
+// 高频 worker 只读取 AT/注册状态，不深拷贝完整状态中的字符串。
+IdfModemReadiness idf_modem_get_readiness(uint8_t slot);
+std::string idf_modem_get_phone_number(uint8_t slot);
 // 获取合法数字 IMEI；优先使用缓存，缓存缺失时通过模组标准 IMEI 命令补采。
 esp_err_t idf_modem_get_imei(uint8_t slot, std::string& imei);
 // AT 通道当前是否空闲（Web 路由用于"模组正忙"快速返回，避免长时间阻塞 httpd 任务）

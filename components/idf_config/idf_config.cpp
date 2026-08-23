@@ -29,6 +29,22 @@ static IdfConfig s_config;
 static SemaphoreHandle_t s_config_mutex = nullptr;
 static SemaphoreHandle_t s_persist_mutex = nullptr;
 
+struct ModemNvsKeys {
+    const char* led;
+    const char* call;
+    const char* data;
+    const char* roaming;
+    const char* apn;
+    const char* plmn;
+    const char* phone;
+};
+
+// 同一组 key 被加载、整包保存和单字段保存共用，避免各路径反复格式化。
+static constexpr ModemNvsKeys MODEM_NVS_KEYS[2] = {
+    {"m0Led", "m0Call", "m0Data", "m0Roam", "m0Apn", "m0Plmn", "m0Phone"},
+    {"m1Led", "m1Call", "m1Data", "m1Roam", "m1Apn", "m1Plmn", "m1Phone"},
+};
+
 static esp_err_t save_config_to_nvs(const IdfConfig& c);
 static esp_err_t commit_config_update(IdfConfig& next, const IdfConfig& base);
 
@@ -559,15 +575,15 @@ esp_err_t idf_config_load(void)
         next.smsHealthNotify = read_bool(nvs, "smsHlthNt", true);
 
         for (int slot = 0; slot < 2; ++slot) {
-            char key[16];
+            const ModemNvsKeys& keys = MODEM_NVS_KEYS[slot];
             IdfModemSlotConfig& modem = next.modems[slot];
-            snprintf(key, sizeof(key), "m%dLed", slot); modem.netLedEnabled = read_bool(nvs, key, true);
-            snprintf(key, sizeof(key), "m%dCall", slot); modem.callNotifyEnabled = read_bool(nvs, key, true);
-            snprintf(key, sizeof(key), "m%dData", slot); modem.dataEnabled = read_bool(nvs, key, false);
-            snprintf(key, sizeof(key), "m%dRoam", slot); modem.roamingEnabled = read_bool(nvs, key, true);
-            snprintf(key, sizeof(key), "m%dApn", slot); modem.apn = read_str(nvs, key, "", 96);
-            snprintf(key, sizeof(key), "m%dPlmn", slot); modem.operatorPlmn = read_str(nvs, key, "", 16);
-            snprintf(key, sizeof(key), "m%dPhone", slot); modem.phoneNumber = read_str(nvs, key, "", 64);
+            modem.netLedEnabled = read_bool(nvs, keys.led, true);
+            modem.callNotifyEnabled = read_bool(nvs, keys.call, true);
+            modem.dataEnabled = read_bool(nvs, keys.data, false);
+            modem.roamingEnabled = read_bool(nvs, keys.roaming, true);
+            modem.apn = read_str(nvs, keys.apn, "", 96);
+            modem.operatorPlmn = read_str(nvs, keys.plmn, "", 16);
+            modem.phoneNumber = read_str(nvs, keys.phone, "", 64);
         }
         for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
             char key[20];
@@ -1054,9 +1070,7 @@ esp_err_t idf_config_set_net_led_enabled(uint8_t slot, bool enabled)
     nvs_handle_t nvs = 0;
     err = nvs_open("sms_config", NVS_READWRITE, &nvs);
     if (err == ESP_OK) {
-        char key[16];
-        snprintf(key, sizeof(key), "m%uLed", static_cast<unsigned>(slot));
-        err = nvs_set_u8(nvs, key, enabled ? 1 : 0);
+        err = nvs_set_u8(nvs, MODEM_NVS_KEYS[slot].led, enabled ? 1 : 0);
         if (err == ESP_OK) err = nvs_commit(nvs);
         nvs_close(nvs);
     }
@@ -1084,9 +1098,7 @@ esp_err_t idf_config_set_call_notify_enabled(uint8_t slot, bool enabled)
     nvs_handle_t nvs = 0;
     err = nvs_open("sms_config", NVS_READWRITE, &nvs);
     if (err == ESP_OK) {
-        char key[16];
-        snprintf(key, sizeof(key), "m%uCall", static_cast<unsigned>(slot));
-        err = nvs_set_u8(nvs, key, enabled ? 1 : 0);
+        err = nvs_set_u8(nvs, MODEM_NVS_KEYS[slot].call, enabled ? 1 : 0);
         if (err == ESP_OK) err = nvs_commit(nvs);
         nvs_close(nvs);
     }
@@ -1161,15 +1173,15 @@ static esp_err_t save_config_to_nvs(const IdfConfig& c)
     if (err == ESP_OK) err = nvs_set_u8(nvs, "smsHlthNt", c.smsHealthNotify ? 1 : 0);
 
     for (int slot = 0; err == ESP_OK && slot < 2; ++slot) {
-        char key[16];
+        const ModemNvsKeys& keys = MODEM_NVS_KEYS[slot];
         const IdfModemSlotConfig& modem = c.modems[slot];
-        snprintf(key, sizeof(key), "m%dLed", slot); err = nvs_set_u8(nvs, key, modem.netLedEnabled ? 1 : 0);
-        snprintf(key, sizeof(key), "m%dCall", slot); if (err == ESP_OK) err = nvs_set_u8(nvs, key, modem.callNotifyEnabled ? 1 : 0);
-        snprintf(key, sizeof(key), "m%dData", slot); if (err == ESP_OK) err = nvs_set_u8(nvs, key, modem.dataEnabled ? 1 : 0);
-        snprintf(key, sizeof(key), "m%dRoam", slot); if (err == ESP_OK) err = nvs_set_u8(nvs, key, modem.roamingEnabled ? 1 : 0);
-        snprintf(key, sizeof(key), "m%dApn", slot); if (err == ESP_OK) err = write_str(nvs, key, modem.apn);
-        snprintf(key, sizeof(key), "m%dPlmn", slot); if (err == ESP_OK) err = write_str(nvs, key, modem.operatorPlmn);
-        snprintf(key, sizeof(key), "m%dPhone", slot); if (err == ESP_OK) err = write_str(nvs, key, modem.phoneNumber);
+        err = nvs_set_u8(nvs, keys.led, modem.netLedEnabled ? 1 : 0);
+        if (err == ESP_OK) err = nvs_set_u8(nvs, keys.call, modem.callNotifyEnabled ? 1 : 0);
+        if (err == ESP_OK) err = nvs_set_u8(nvs, keys.data, modem.dataEnabled ? 1 : 0);
+        if (err == ESP_OK) err = nvs_set_u8(nvs, keys.roaming, modem.roamingEnabled ? 1 : 0);
+        if (err == ESP_OK) err = write_str(nvs, keys.apn, modem.apn);
+        if (err == ESP_OK) err = write_str(nvs, keys.plmn, modem.operatorPlmn);
+        if (err == ESP_OK) err = write_str(nvs, keys.phone, modem.phoneNumber);
     }
     for (int i = 0; err == ESP_OK && i < IDF_MAX_SIM_CREDENTIALS; ++i) {
         char key[20];
@@ -1834,17 +1846,12 @@ esp_err_t idf_config_save_sim(uint8_t slot, bool data_enabled, bool roaming_enab
                                                           next_credentials[i].pukMaxAttempts);
     }
 
-    char modem_key[16];
-    snprintf(modem_key, sizeof(modem_key), "m%uData", static_cast<unsigned>(slot));
-    if (err == ESP_OK) err = nvs_set_u8(nvs, modem_key, data_enabled ? 1 : 0);
-    snprintf(modem_key, sizeof(modem_key), "m%uRoam", static_cast<unsigned>(slot));
-    if (err == ESP_OK) err = nvs_set_u8(nvs, modem_key, roaming_enabled ? 1 : 0);
-    snprintf(modem_key, sizeof(modem_key), "m%uApn", static_cast<unsigned>(slot));
-    if (err == ESP_OK) err = write_str(nvs, modem_key, next_apn);
-    snprintf(modem_key, sizeof(modem_key), "m%uPlmn", static_cast<unsigned>(slot));
-    if (err == ESP_OK) err = write_str(nvs, modem_key, next_operator);
-    snprintf(modem_key, sizeof(modem_key), "m%uPhone", static_cast<unsigned>(slot));
-    if (err == ESP_OK) err = write_str(nvs, modem_key, next_phone);
+    const ModemNvsKeys& keys = MODEM_NVS_KEYS[slot];
+    if (err == ESP_OK) err = nvs_set_u8(nvs, keys.data, data_enabled ? 1 : 0);
+    if (err == ESP_OK) err = nvs_set_u8(nvs, keys.roaming, roaming_enabled ? 1 : 0);
+    if (err == ESP_OK) err = write_str(nvs, keys.apn, next_apn);
+    if (err == ESP_OK) err = write_str(nvs, keys.plmn, next_operator);
+    if (err == ESP_OK) err = write_str(nvs, keys.phone, next_phone);
     for (int i = 0; err == ESP_OK && i < IDF_MAX_SIM_CREDENTIALS; ++i) {
         char key[20];
         const IdfSimCredential& item = next_credentials[i];
@@ -2062,6 +2069,20 @@ IdfSimSettingsView idf_config_get_sim_settings_view(uint8_t slot)
     return view;
 }
 
+IdfSimNetworkView idf_config_get_sim_network_view(uint8_t slot)
+{
+    IdfSimNetworkView view;
+    if (slot >= 2) return view;
+    if (ensure_config_mutex() != ESP_OK) return view;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    view.dataEnabled = s_config.modems[slot].dataEnabled;
+    view.roamingEnabled = s_config.modems[slot].roamingEnabled;
+    view.apn = s_config.modems[slot].apn;
+    view.operatorPlmn = s_config.modems[slot].operatorPlmn;
+    xSemaphoreGive(s_config_mutex);
+    return view;
+}
+
 IdfSimUnlockView idf_config_get_sim_unlock_view(const std::string& iccid)
 {
     IdfSimUnlockView view;
@@ -2128,6 +2149,28 @@ IdfEmailSettingsView idf_config_get_email_settings_view(void)
     view.smtpUser = s_config.smtpUser;
     view.smtpPass = s_config.smtpPass;
     view.smtpSendTo = s_config.smtpSendTo;
+    xSemaphoreGive(s_config_mutex);
+    return view;
+}
+
+IdfSchedulerCoreView idf_config_get_scheduler_core_view(void)
+{
+    IdfSchedulerCoreView view;
+    if (ensure_config_mutex() != ESP_OK) return view;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    view.kaEnabled = s_config.kaEnabled;
+    view.kaSlot = s_config.kaSlot;
+    view.kaIntervalDays = s_config.kaIntervalDays;
+    view.kaLastTime = s_config.kaLastTime;
+    view.tzOffsetMin = s_config.tzOffsetMin;
+    view.rebootEnabled = s_config.rebootEnabled;
+    view.rebootHour = s_config.rebootHour;
+    view.hbEnabled = s_config.hbEnabled;
+    view.hbHour = s_config.hbHour;
+    view.smsHealthEnabled = s_config.smsHealthEnabled;
+    view.smsHealthHour = s_config.smsHealthHour;
+    view.smsHealthNotify = s_config.smsHealthNotify;
+    view.emailEnabled = s_config.emailEnabled;
     xSemaphoreGive(s_config_mutex);
     return view;
 }
@@ -2210,6 +2253,27 @@ bool idf_config_call_notify_enabled(uint8_t slot)
     bool on = s_config.modems[slot].callNotifyEnabled;
     xSemaphoreGive(s_config_mutex);
     return on;
+}
+
+bool idf_config_get_cellular_settings(uint8_t slot, bool& data_enabled, std::string* apn)
+{
+    data_enabled = false;
+    if (apn) apn->clear();
+    if (slot >= 2 || ensure_config_mutex() != ESP_OK) return false;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    data_enabled = s_config.modems[slot].dataEnabled;
+    if (apn) *apn = s_config.modems[slot].apn;
+    xSemaphoreGive(s_config_mutex);
+    return true;
+}
+
+std::string idf_config_get_modem_phone_number(uint8_t slot)
+{
+    if (slot >= 2 || ensure_config_mutex() != ESP_OK) return {};
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    std::string phone = s_config.modems[slot].phoneNumber;
+    xSemaphoreGive(s_config_mutex);
+    return phone;
 }
 
 // 时区/NTP 窄访问器：SNTP 同步回调跑在 tiT(lwip) 任务、事件回调跑在系统事件任务，

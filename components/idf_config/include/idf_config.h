@@ -39,25 +39,25 @@ struct IdfWifiNetwork {
 struct IdfModemSlotConfig {
     bool dataEnabled = false;
     bool roamingEnabled = true;
+    bool netLedEnabled = true;
+    bool callNotifyEnabled = true;
     std::string apn;
     std::string operatorPlmn;
     std::string phoneNumber;
-    bool netLedEnabled = true;
-    bool callNotifyEnabled = true;
 };
 
 // 进阶定时任务：可选定目标 eSIM Profile，每 N 天执行一个动作，完成后可切回原卡
 struct IdfSchedTask {
-    uint8_t slot = 0;
-    bool enabled = false;
     std::string name;        // 显示名
     std::string profile;     // 目标 eSIM Profile(ICCID/别名)；空 = 不切卡，用当前卡
-    bool switchBack = true;  // 任务完成后切回执行前启用的 Profile
-    int intervalDays = 30;   // 触发周期（天）
-    uint8_t action = 0;      // 0=推送提醒 1=蜂窝HTTP ping 2=发短信 3=USSD
     std::string target;      // ping URL / 短信号码 / USSD 码
     std::string payload;     // 推送/短信内容
+    int intervalDays = 30;   // 触发周期（天）
     uint32_t lastRun = 0;    // 基准时间（epoch），0=未建立
+    uint8_t slot = 0;
+    uint8_t action = 0;      // 0=推送提醒 1=蜂窝HTTP ping 2=发短信 3=USSD
+    bool enabled = false;
+    bool switchBack = true;  // 任务完成后切回执行前启用的 Profile
 };
 
 struct IdfPushChannel {
@@ -261,6 +261,14 @@ struct IdfSimSettingsView {
     IdfSimCredential credentials[IDF_MAX_SIM_CREDENTIALS];
 };
 
+// 模组状态机专用：不携带与网络配置无关的 PIN/PUK 凭据。
+struct IdfSimNetworkView {
+    bool dataEnabled = false;
+    bool roamingEnabled = true;
+    std::string apn;
+    std::string operatorPlmn;
+};
+
 struct IdfSimUnlockView {
     bool found = false;
     IdfSimCredential credential;
@@ -296,6 +304,23 @@ struct IdfEmailSettingsView {
     std::string smtpSendTo;
 };
 
+// 5 秒调度循环只需系统级开关；自定义任务详情按小时逐项读取。
+struct IdfSchedulerCoreView {
+    bool kaEnabled = false;
+    uint8_t kaSlot = 0;
+    int kaIntervalDays = 175;
+    uint32_t kaLastTime = 0;
+    int tzOffsetMin = 480;
+    bool rebootEnabled = false;
+    int rebootHour = 4;
+    bool hbEnabled = false;
+    int hbHour = 9;
+    bool smsHealthEnabled = false;
+    int smsHealthHour = 10;
+    bool smsHealthNotify = true;
+    bool emailEnabled = true;
+};
+
 struct IdfSchedulerView {
     bool kaEnabled = false;
     uint8_t kaSlot = 0;
@@ -319,11 +344,13 @@ IdfConfigWebView idf_config_get_web_view(void);
 IdfKeepaliveRunView idf_config_get_keepalive_run_view(void);
 IdfSchedRunView idf_config_get_sched_run_view(int index);
 IdfSimSettingsView idf_config_get_sim_settings_view(uint8_t slot);
+IdfSimNetworkView idf_config_get_sim_network_view(uint8_t slot);
 IdfSimUnlockView idf_config_get_sim_unlock_view(const std::string& iccid);
 IdfSmsProcessView idf_config_get_sms_process_view(void);
 IdfPushForwardView idf_config_get_push_forward_view(void);
 IdfPushNotifyView idf_config_get_push_notify_view(void);
 IdfEmailSettingsView idf_config_get_email_settings_view(void);
+IdfSchedulerCoreView idf_config_get_scheduler_core_view(void);
 IdfSchedulerView idf_config_get_scheduler_view(void);
 bool idf_config_get_push_channel(uint8_t channel, IdfPushChannel& out);
 bool idf_config_email_configured(void);
@@ -332,6 +359,9 @@ bool idf_config_check_web_auth(const char* user, const char* pass);
 // 模组初始化只需这一个开关，锁内求值避免在模组任务栈上放全量配置副本
 bool idf_config_net_led_enabled(uint8_t slot);
 bool idf_config_call_notify_enabled(uint8_t slot);
+// 推送 worker 的蜂窝出口窄访问器：apn=nullptr 时只读取开关，避免复制 5 组 SIM 凭据。
+bool idf_config_get_cellular_settings(uint8_t slot, bool& data_enabled, std::string* apn);
+std::string idf_config_get_modem_phone_number(uint8_t slot);
 // 时区/NTP 窄访问器：给运行在小栈任务(tiT/lwip、系统事件)的 SNTP 回调用，
 // 避免深拷贝整个 IdfConfig 到小栈上导致爆栈
 int idf_config_get_tz_offset(void);

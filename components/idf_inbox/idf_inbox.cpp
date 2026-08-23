@@ -5,6 +5,7 @@
 
 #include <array>
 #include <algorithm>
+#include <new>
 #include <vector>
 
 #include "esp_log.h"
@@ -35,8 +36,10 @@ struct InboxSlot : IdfInboxEntry {
 };
 
 static SemaphoreHandle_t s_mutex = nullptr;
-static std::array<InboxSlot, INBOX_MAX> s_inbox;
-static std::array<IdfSentEntry, SENT_MAX> s_sent;
+alignas(InboxSlot) static unsigned char s_inbox_storage[sizeof(InboxSlot) * INBOX_MAX];
+alignas(IdfSentEntry) static unsigned char s_sent_storage[sizeof(IdfSentEntry) * SENT_MAX];
+static InboxSlot* s_inbox = nullptr;
+static IdfSentEntry* s_sent = nullptr;
 static size_t s_inbox_head = 0;
 static size_t s_inbox_filled = 0;
 static uint32_t s_inbox_seq = 0;
@@ -50,6 +53,12 @@ static nvs_handle_t s_sent_nvs = 0;
 
 static void ensure_init()
 {
+    if (!s_inbox) {
+        s_inbox = reinterpret_cast<InboxSlot*>(s_inbox_storage);
+        for (size_t i = 0; i < INBOX_MAX; ++i) new (&s_inbox[i]) InboxSlot;
+        s_sent = reinterpret_cast<IdfSentEntry*>(s_sent_storage);
+        for (size_t i = 0; i < SENT_MAX; ++i) new (&s_sent[i]) IdfSentEntry;
+    }
     if (!s_mutex) s_mutex = xSemaphoreCreateMutex();
 }
 

@@ -7,21 +7,21 @@
 
 struct IdfInboxEntry {
     uint8_t slot = 0;
+    bool forwarded = false;
     uint32_t id = 0;
     uint32_t recvEpoch = 0;
     std::string sender;
     std::string ts;
     std::string text;
-    bool forwarded = false;
 };
 
 struct IdfSentEntry {
     uint8_t slot = 0;
+    bool ok = false;
     uint32_t id = 0;
     uint32_t sentEpoch = 0;
     std::string target;
     std::string text;
-    bool ok = false;
 };
 
 void idf_inbox_init(void);

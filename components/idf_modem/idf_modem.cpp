@@ -19,6 +19,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "idf_config.h"
 #include "idf_log.h"
 #include "idf_util.h"
 #include "nvs.h"
@@ -449,10 +450,41 @@ static IdfModemStatus get_status(ModemContext& ctx)
     return copy;
 }
 
+struct ModemRuntimeStatus {
+    int ceregStat = -1;
+    int rsrp = 999;
+    int rsrq = 999;
+    int sinr = 999;
+    bool atReady = false;
+    bool modemReady = false;
+    bool simReady = false;
+    bool cellIpEmpty = true;
+    bool samplingDone = false;
+};
+
+// 高频状态机只读取紧凑运行态，避免每轮深拷贝完整状态中的字符串。
+static ModemRuntimeStatus get_runtime_status(ModemContext& ctx)
+{
+    ModemRuntimeStatus state;
+    if (!ctx.status_mutex) return state;
+    if (xSemaphoreTake(ctx.status_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        state.ceregStat = ctx.status.ceregStat;
+        state.rsrp = ctx.status.rsrp;
+        state.rsrq = ctx.status.rsrq;
+        state.sinr = ctx.status.sinr;
+        state.atReady = ctx.status.atReady;
+        state.modemReady = ctx.status.modemReady;
+        state.simReady = ctx.status.simState == "ready";
+        state.cellIpEmpty = ctx.status.cellIp.empty();
+        state.samplingDone = ctx.status.signalFresh && ctx.status.identityFresh;
+        xSemaphoreGive(ctx.status_mutex);
+    }
+    return state;
+}
+
 static bool startup_sampling_done(ModemContext& ctx)
 {
-    IdfModemStatus status = get_status(ctx);
-    return status.signalFresh && status.identityFresh;
+    return get_runtime_status(ctx).samplingDone;
 }
 
 static void reset_identity_sampling_state(ModemContext& ctx)
@@ -1552,7 +1584,7 @@ static bool parse_cesq_signal(const std::string& resp, IdfModemStatus& patch)
 
 static void sample_signal_detail_once(ModemContext& ctx)
 {
-    IdfModemStatus current = get_status(ctx);
+    ModemRuntimeStatus current = get_runtime_status(ctx);
     if (!current.modemReady) return;
     std::string resp;
     IdfModemStatus patch;
@@ -1587,7 +1619,7 @@ static bool model_skips_cgact(ModemContext& ctx)
     return model == "ML307Y";
 }
 
-static bool apply_configured_data_mode_once(ModemContext& ctx, const IdfSimSettingsView& cfg,
+static bool apply_configured_data_mode_once(ModemContext& ctx, const IdfSimNetworkView& cfg,
                                             uint32_t active_timeout_ms,
                                             uint32_t inactive_timeout_ms)
 {
@@ -1596,7 +1628,7 @@ static bool apply_configured_data_mode_once(ModemContext& ctx, const IdfSimSetti
     // 数据漫游策略：未勾选"允许数据漫游"且当前处于漫游(CEREG=5)时不激活蜂窝数据。
     // 启动阶段注册状态未知(stat=-1)会乐观激活，注册完成后由 enforce_roaming_data_policy 兜底关闭。
     bool want_data = cfg.dataEnabled &&
-                     (cfg.roamingEnabled || get_status(ctx).ceregStat != 5);
+                     (cfg.roamingEnabled || get_runtime_status(ctx).ceregStat != 5);
     if (want_data) {
         if (!apn.empty() && apn_valid_for_at(apn)) {
             std::string cmd = "AT+CGDCONT=1,\"IP\",\"";
@@ -1620,11 +1652,11 @@ static bool apply_configured_data_mode_once(ModemContext& ctx, const IdfSimSetti
 // 启动阶段拿不到注册状态会先乐观激活，注册完成后在此关闭，避免漫游误跑流量。
 // 此开关只控制数据 PDP；短信是否可用由 SIM、模组和运营商短信承载共同决定，
 // 不能仅凭 CEREG/CREG 中的某一个状态判断。归属网络(stat=1)不干预，按常规激活。
-static void enforce_roaming_data_policy(ModemContext& ctx, const IdfSimSettingsView& cfg, int stat)
+static void enforce_roaming_data_policy(ModemContext& ctx, const IdfSimNetworkView& cfg, int stat)
 {
     if (!cfg.dataEnabled || cfg.roamingEnabled) return;  // 未开数据或允许漫游数据：无需干预
     if (stat != 5) return;                                // 非漫游：归属网络按常规激活即可
-    if (get_status(ctx).cellIp.empty()) return;           // 数据本就未激活，无需再关
+    if (get_runtime_status(ctx).cellIpEmpty) return;      // 数据本就未激活，无需再关
     std::string resp;
     if (send_ok(ctx, "AT+CGACT=0,1", 3000, &resp)) {
         set_status_cell_ip(ctx, "");
@@ -1645,7 +1677,7 @@ static void apply_startup_data_mode(ModemContext& ctx)
         MODEM_LOG_LINE(ctx, "该型号跳过启动 CGACT 配置");
         return;
     }
-    IdfSimSettingsView cfg = idf_config_get_sim_settings_view(ctx.hardware.slot);
+    IdfSimNetworkView cfg = idf_config_get_sim_network_view(ctx.hardware.slot);
     bool ok = apply_configured_data_mode_once(ctx, cfg, 6000, 2500);
     if (ok) {
         MODEM_LOG_LINE(ctx, cfg.dataEnabled ? "已按配置启用蜂窝数据(AT+CGACT=1,1)"
@@ -1667,7 +1699,7 @@ static bool plmn_valid(const std::string& plmn)
     return true;
 }
 
-static void apply_operator_if_configured(ModemContext& ctx, const IdfSimSettingsView& cfg)
+static void apply_operator_if_configured(ModemContext& ctx, const IdfSimNetworkView& cfg)
 {
     if (cfg.operatorPlmn.empty()) return;
     if (!plmn_valid(cfg.operatorPlmn)) {
@@ -1690,7 +1722,7 @@ static bool process_data_mode_retry(ModemContext& ctx)
     if (!at_channel_idle_now(ctx)) return false;
 
     ++ctx.data_mode_retry_count;
-    IdfSimSettingsView cfg = idf_config_get_sim_settings_view(ctx.hardware.slot);
+    IdfSimNetworkView cfg = idf_config_get_sim_network_view(ctx.hardware.slot);
     bool ok = apply_configured_data_mode_once(ctx, cfg, 8000, 3000);
     if (ok) {
         ctx.data_mode_retry_pending = false;
@@ -2212,7 +2244,7 @@ bool idf_modem_sms_health_check(uint8_t slot, std::string& summary)
         return false;
     }
     ModemContext& ctx = *context;
-    if (!get_status(ctx).atReady) {
+    if (!get_runtime_status(ctx).atReady) {
         idf_modem_request_reset(slot, true);
         summary = "模组 AT 未就绪，已请求模组硬重启";
         MODEM_LOGF(ctx, "每日短信体检异常: %s", summary.c_str());
@@ -2405,7 +2437,7 @@ static void modem_task(void* arg)
         set_phase(ctx, "failed");
     } else {
         retry_sms_storage_if_pending(ctx);
-        IdfSimSettingsView cfg = idf_config_get_sim_settings_view(ctx.hardware.slot);
+        IdfSimNetworkView cfg = idf_config_get_sim_network_view(ctx.hardware.slot);
         apply_operator_if_configured(ctx, cfg);
         if (cfg.dataEnabled) sample_cell_ip_once(ctx);
         enforce_roaming_data_policy(ctx, cfg, stat);
@@ -2435,10 +2467,10 @@ static void modem_task(void* arg)
         }
         bool reset_handled = handle_reset_request_if_any(ctx);
         run_pending_reinit_if_recovered(ctx);
-        if (!sim_ready && get_status(ctx).simState == "ready") sim_ready = true;
+        if (!sim_ready && get_runtime_status(ctx).simReady) sim_ready = true;
         TickType_t now = xTaskGetTickCount();
         if (reset_handled) {
-            sim_ready = get_status(ctx).simState == "ready";
+            sim_ready = get_runtime_status(ctx).simReady;
             // 运行中重启不能沿用重启前的局部注册状态；否则 status 已进入 registering，
             // 但本任务仍以 registered=true 按 60 秒慢周期探测，换卡后恢复会被无谓拖延。
             registered = false;
@@ -2482,8 +2514,9 @@ static void modem_task(void* arg)
             if (force_sample) {
                 ctx.status_sample_requests.store(0, std::memory_order_relaxed);
             }
-            const IdfSimSettingsView sim_cfg = idf_config_get_sim_settings_view(ctx.hardware.slot);
-            if (sim_cfg.dataEnabled && get_status(ctx).cellIp.empty() &&
+            bool data_enabled = false;
+            idf_config_get_cellular_settings(ctx.hardware.slot, data_enabled, nullptr);
+            if (data_enabled && get_runtime_status(ctx).cellIpEmpty &&
                 (last_cell_ip == 0 ||
                  now - last_cell_ip > pdMS_TO_TICKS(MODEM_DATA_MODE_RETRY_GAP_MS))) {
                 sample_cell_ip_once(ctx);
@@ -2545,7 +2578,7 @@ static void modem_task(void* arg)
                         if (!sms_reconfigured_now) {
                             ctx.sms_storage_pending = !select_sms_storage(ctx);
                         }
-                        IdfSimSettingsView cfg = idf_config_get_sim_settings_view(ctx.hardware.slot);
+                        IdfSimNetworkView cfg = idf_config_get_sim_network_view(ctx.hardware.slot);
                         apply_operator_if_configured(ctx, cfg);
                         if (cfg.dataEnabled) sample_cell_ip_once(ctx);
                         enforce_roaming_data_policy(ctx, cfg, stat);
@@ -2655,7 +2688,7 @@ static void modem_task(void* arg)
     }
 }
 
-esp_err_t idf_modem_start(uint8_t slot, const IdfConfig& config)
+esp_err_t idf_modem_start(uint8_t slot)
 {
     ModemContext* context = context_for_slot(slot);
     if (!context) return ESP_ERR_INVALID_ARG;
@@ -2673,7 +2706,9 @@ esp_err_t idf_modem_start(uint8_t slot, const IdfConfig& config)
         cleanup_start_resources(ctx);
         return ESP_ERR_NO_MEM;
     }
-    if (!config.modems[slot].dataEnabled) set_status_cell_ip(ctx, "");
+    bool data_enabled = false;
+    idf_config_get_cellular_settings(slot, data_enabled, nullptr);
+    if (!data_enabled) set_status_cell_ip(ctx, "");
 
     uart_config_t uart_cfg = {};
     uart_cfg.baud_rate = MODEM_BAUD;
@@ -2733,6 +2768,31 @@ IdfModemStatus idf_modem_get_status(uint8_t slot)
     invalid.phase = "invalid_slot";
     invalid.simUnlockMessage = "非法模组 slot";
     return invalid;
+}
+
+IdfModemReadiness idf_modem_get_readiness(uint8_t slot)
+{
+    IdfModemReadiness readiness;
+    ModemContext* ctx = context_for_slot(slot);
+    if (!ctx || !ctx->status_mutex) return readiness;
+    if (xSemaphoreTake(ctx->status_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        readiness.atReady = ctx->status.atReady;
+        readiness.modemReady = ctx->status.modemReady;
+        xSemaphoreGive(ctx->status_mutex);
+    }
+    return readiness;
+}
+
+std::string idf_modem_get_phone_number(uint8_t slot)
+{
+    ModemContext* ctx = context_for_slot(slot);
+    if (!ctx || !ctx->status_mutex) return {};
+    std::string phone;
+    if (xSemaphoreTake(ctx->status_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        phone = ctx->status.phone;
+        xSemaphoreGive(ctx->status_mutex);
+    }
+    return phone;
 }
 
 esp_err_t idf_modem_get_imei(uint8_t slot, std::string& imei)

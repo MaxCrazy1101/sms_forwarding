@@ -71,12 +71,12 @@ extern "C" void app_main(void)
              static_cast<unsigned>(WEB_APP_CSS.length),
              static_cast<unsigned>(WEB_APP_JS.length));
     idf_esim_init();  // 注册 SIM 热插拔钩子，换卡后 EID 缓存随之失效
+    idf_sms_init();   // Web 启动后会读取双槽短信状态，必须先构造对应运行态
     log_start_result("WiFi", idf_wifi_start(idf_config_get()));
     log_start_result("推送后台 worker", idf_push_start());
     log_start_result("HTTP 服务器", idf_web_start());
-    const IdfConfig& config = idf_config_get();
-    esp_err_t modem0 = idf_modem_start(0, config);
-    esp_err_t modem1 = idf_modem_start(1, config);
+    esp_err_t modem0 = idf_modem_start(0);
+    esp_err_t modem1 = idf_modem_start(1);
     log_start_result("卡槽1模组", modem0);
     log_start_result("卡槽2模组", modem1);
     // UART/owner 资源创建失败时只跳过同槽 SMS worker；另一槽和共享服务继续运行。
