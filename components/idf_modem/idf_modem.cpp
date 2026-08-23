@@ -329,7 +329,8 @@ static void set_phase(const char* phase)
     }
 }
 
-static void update_status(const IdfModemStatus& patch, bool identity = false, bool signal = false)
+static void update_status(const IdfModemStatus& patch, bool identity = false, bool signal = false,
+                          bool sim = false)
 {
     if (xSemaphoreTake(s_status_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return;
     s_status.started = patch.started || s_status.started;
@@ -368,7 +369,7 @@ static void update_status(const IdfModemStatus& patch, bool identity = false, bo
     if (!patch.apnSim.empty()) s_status.apnSim = patch.apnSim;
     if (!patch.cellIp.empty()) s_status.cellIp = patch.cellIp;
     if (!patch.phone.empty()) s_status.phone = patch.phone;
-    if (patch.simState != "unknown") {
+    if (sim) {
         s_status.simState = patch.simState;
         s_status.simCredentialMatched = patch.simCredentialMatched;
         s_status.simUnlockMessage = patch.simUnlockMessage;
@@ -816,7 +817,7 @@ static void set_sim_status(const std::string& state, bool matched, const std::st
     patch.simUnlockMessage = message;
     patch.iccid = iccid;
     if (state == "pin" || state == "puk" || state == "other") patch.phase = "sim_locked";
-    update_status(patch, !iccid.empty());
+    update_status(patch, !iccid.empty(), false, true);
 }
 
 static constexpr bool sim_unlock_allowed(bool has_secret, uint8_t failed, uint8_t limit,
@@ -2072,6 +2073,16 @@ static bool configure_sms_and_registration(void)
     return sms_ready;
 }
 
+// SIM 就绪后的初始化顺序必须保持一致；启动、重启恢复和凭据解锁都走同一入口。
+static bool initialize_sim_stack(bool allow_puk)
+{
+    if (!try_unlock_sim(allow_puk)) return false;
+    configure_sms_and_registration();
+    set_phase("registering");
+    apply_startup_data_mode();
+    return true;
+}
+
 static bool response_has_compact(std::string response, const char* expected)
 {
     response.erase(std::remove_if(response.begin(), response.end(), [](unsigned char ch) {
@@ -2141,13 +2152,6 @@ bool idf_modem_sms_health_check(std::string& summary)
     return false;
 }
 
-// 锁 PIN/PUK 的 SIM 仍然在位，热插拔检测不能把它当成拔卡并触发重启循环。
-static bool query_sim_present(void)
-{
-    std::string state = query_sim_state();
-    return state != "absent" && state != "unknown";
-}
-
 // 重启后 AT 握手失败时置位：一旦后续任何探测发现 AT 恢复，立即补跑完整初始化
 // (ATE0/CMGF/CNMI/CEREG/CGACT)。否则模组以默认配置运行——回显开着、URC 不上报、
 // 数据连接按模组默认自动激活(产生流量费，恰是本项目要防止的)。
@@ -2188,11 +2192,7 @@ static bool handle_reset_request_if_any(void)
     patch.modemReady = false;
     patch.phase = "at_ready";
     update_status(patch);
-    if (try_unlock_sim(false)) {
-        configure_sms_and_registration();
-        set_phase("registering");
-        apply_startup_data_mode();
-    }
+    initialize_sim_stack(false);
     s_reinit_pending = false;
     return true;
 }
@@ -2210,11 +2210,7 @@ static void run_pending_reinit_if_recovered(void)
     patch.modemReady = false;
     patch.phase = "at_ready";
     update_status(patch);
-    if (try_unlock_sim(false)) {
-        configure_sms_and_registration();
-        set_phase("registering");
-        apply_startup_data_mode();
-    }
+    initialize_sim_stack(false);
     s_reinit_pending = false;
 }
 
@@ -2276,12 +2272,7 @@ static void modem_task(void*)
     ESP_LOGI(TAG, "AT 已就绪");
     idf_log_line("模组 AT 已就绪");
 
-    bool sim_ready = try_unlock_sim(false);
-    if (sim_ready) {
-        configure_sms_and_registration();
-        set_phase("registering");
-        apply_startup_data_mode();
-    }
+    bool sim_ready = initialize_sim_stack(false);
 
     int check_count = 0;
     int stat = -1;
@@ -2354,12 +2345,9 @@ static void modem_task(void*)
                 s_sim_unlock_request.store(unlock_request, std::memory_order_relaxed);
             } else {
                 if (unlock_request == 1) s_last_pin_attempt_key.clear();
-                sim_ready = try_unlock_sim(unlock_request == 2);
+                sim_ready = initialize_sim_stack(unlock_request == 2);
             }
             if (sim_ready && at_channel_idle_now()) {
-                configure_sms_and_registration();
-                set_phase("registering");
-                apply_startup_data_mode();
                 registered = false;
                 post_register_done = false;
                 sms_reconfigure_pending = true;
@@ -2480,15 +2468,14 @@ static void modem_task(void*)
             (last_sim_check == 0 || now - last_sim_check > pdMS_TO_TICKS(SIM_CHECK_INTERVAL_MS)) &&
             at_channel_idle_now()) {
             last_sim_check = now;
-            int present_now = query_sim_present() ? 1 : 0;
-            if (sim_present == -1) {
-                sim_present = present_now;  // 首次仅记基线，不当作插拔事件
-            } else if (present_now != sim_present) {
+            std::string sim_state_now = query_sim_state();
+            // 查询超时不等于拔卡：保留原基线，等待下一次 CPIN 返回确定状态。
+            if (sim_state_now != "unknown") {
+                int previous_present = sim_present;
+                int present_now = sim_state_now == "absent" ? 0 : 1;
                 sim_present = present_now;
-                if (present_now == 1) {
-                    // 仅在 CPIN READY 时立即重发 CMGF/CNMI 不够可靠：部分 ML307 固件会在
-                    // 换卡后继续异步重建协议栈，随后把短信模式恢复默认值。自动硬重启一次，
-                    // 等价于用户手动断电恢复，同时保留“换卡无需重启 ESP32”的体验。
+                if (previous_present == 0 && present_now == 1) {
+                    // 部分 ML307 固件换卡后会继续异步重建协议栈，必须硬重启才能稳定恢复短信配置。
                     idf_log_line("检测到 SIM 卡插入，自动硬重启模组以完整初始化短信栈");
                     idf_modem_invalidate_sim_identity();
                     registered = false;
@@ -2496,7 +2483,7 @@ static void modem_task(void*)
                     dereg_count = 0;
                     sms_reconfigure_pending = true;
                     idf_modem_request_reset(true);
-                } else {
+                } else if (previous_present == 1 && present_now == 0) {
                     idf_log_line("检测到 SIM 卡移除");
                     registered = false;
                     post_register_done = false;
@@ -2505,6 +2492,20 @@ static void modem_task(void*)
                     idf_modem_invalidate_sim_identity();
                     set_sim_status("absent", false, "未检测到 SIM");
                     set_phase("registering");
+                } else if (previous_present == -1 && present_now == 0 && !sim_ready) {
+                    set_sim_status("absent", false, "未检测到 SIM");
+                } else if (!sim_ready && present_now == 1 &&
+                           (previous_present == -1 || sim_state_now == "ready")) {
+                    if (sim_state_now == "ready") {
+                        idf_log_line("检测到 SIM 已就绪，恢复短信和网络初始化");
+                    }
+                    sim_ready = initialize_sim_stack(false);
+                    if (sim_ready) {
+                        registered = false;
+                        post_register_done = false;
+                        sms_reconfigure_pending = true;
+                        last_health = 0;
+                    }
                 }
             }
         }
