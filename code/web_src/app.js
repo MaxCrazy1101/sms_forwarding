@@ -162,8 +162,8 @@
         html += '<div class="form-group"><label>点击动作 action</label><select id="bark_action' + idx + '" data-bark-key="action"><option value="">默认</option><option value="alert">alert 弹窗</option></select></div>';
         html += '<div class="form-group"><label>通知 ID id</label><input type="text" id="bark_id' + idx + '" data-bark-key="id" placeholder="同 ID 会更新通知"></div>';
         html += '<div class="form-group"><label>其它参数</label><input type="text" id="bark_other' + idx + '" placeholder="markdown=...&ciphertext=..."></div>';
-        html += '</div><p class="form-hint">保存时会自动合成为 Bark 参数；可用 {sender} {receiver} {message} {timestamp} 占位符。</p></div></details></div>';
-        html += '<div id="custom' + idx + '" style="display:none;"><div class="form-group"><label>请求体模板（使用 {sender} {receiver} {local_number} {message} {timestamp} 占位符）</label><textarea name="push' + idx + 'body" rows="4" style="width:100%;font-family:monospace;">' + htmlEsc(ch.customBody || '') + '</textarea></div></div>';
+        html += '</div><p class="form-hint">保存时会自动合成为 Bark 参数；可用 {slot} {sender} {receiver} {message} {timestamp} 占位符。</p></div></details></div>';
+        html += '<div id="custom' + idx + '" style="display:none;"><div class="form-group"><label>请求体模板（使用 {slot} {sender} {receiver} {local_number} {message} {timestamp} 占位符）</label><textarea name="push' + idx + 'body" rows="4" style="width:100%;font-family:monospace;">' + htmlEsc(ch.customBody || '') + '</textarea></div></div>';
         html += '<button type="button" class="btn btn-secondary btn-sm" onclick="testPush(' + idx + ', this)">测试推送</button><div class="result-box" id="pushTestResult' + idx + '"></div>';
         html += '</div></div>';
       }
@@ -171,6 +171,7 @@
     }
     function renderConfigTemplate(html) {
       var c = webConfig || {};
+      var modem = (Array.isArray(c.modems) && c.modems[0]) || {};
       var map = {
         WEB_USER: htmlEsc(c.webUser || ''), WEB_PASS: htmlEsc(c.webPass || ''),
         SMTP_SERVER: htmlEsc(c.smtpServer || ''), SMTP_PORT: String(c.smtpPort || 465),
@@ -181,13 +182,42 @@
         NTP: htmlEsc(c.ntpServer || ''), MDNS_HOST: htmlEsc(c.mdnsHost || 'sms'), RB_CHECKED: checked(c.rebootEnabled), RB_HOUR: String(c.rebootHour == null ? 3 : c.rebootHour),
         HB_CHECKED: checked(c.hbEnabled), HB_HOUR: String(c.hbHour == null ? 9 : c.hbHour), TZ_OPTIONS: buildTzOptions(c.tzOffsetMin),
         SMS_HEALTH_CHECKED: checked(c.smsHealthEnabled), SMS_HEALTH_HOUR: String(c.smsHealthHour == null ? 10 : c.smsHealthHour), SMS_HEALTH_NOTIFY_CHECKED: checked(c.smsHealthNotify !== false),
-        DATA_CHECKED: checked(c.dataEnabled), ROAMING_CHECKED: checked(c.roamingEnabled !== false),
-        APN: htmlEsc(c.apn || ''), PHONE_NUMBER: htmlEsc(c.phoneNumber || ''),
-        OPERATOR_PLMN: htmlEsc(c.operatorPlmn || ''), KA_PROFILE: htmlEsc(c.kaProfile || ''), PUSH_CHANNELS: buildPushChannels(c.pushChannels),
+        DATA_CHECKED: checked(modem.dataEnabled), ROAMING_CHECKED: checked(modem.roamingEnabled !== false),
+        APN: htmlEsc(modem.apn || ''), PHONE_NUMBER: htmlEsc(modem.phoneNumber || ''),
+        OPERATOR_PLMN: htmlEsc(modem.operatorPlmn || ''), KA_PROFILE: htmlEsc(c.kaProfile || ''), PUSH_CHANNELS: buildPushChannels(c.pushChannels),
         WIFI_NETWORKS: buildWifiNetworks(c.wifiNetworks), WIFI_TX_POWER_OPTIONS: buildWifiTxPowerOptions(c.wifiTxPowerQuarterDbm), SIM_CREDENTIALS: buildSimCredentials(c.simCredentials),
-        NETLED_CHECKED: checked(c.netLedEnabled !== false), CALLNOTIFY_CHECKED: checked(c.callNotifyEnabled !== false), UPTIME: htmlEsc(c.uptimeText || '')
+        NETLED_CHECKED: checked(modem.netLedEnabled !== false), CALLNOTIFY_CHECKED: checked(modem.callNotifyEnabled !== false), UPTIME: htmlEsc(c.uptimeText || '')
       };
       return html.replace(/%([A-Z0-9_]{2,})%/g, function(m, k){ return Object.prototype.hasOwnProperty.call(map, k) ? map[k] : m; });
+    }
+    function selectedSlot(id) {
+      var el = document.getElementById(id);
+      if (!el || (el.value !== '0' && el.value !== '1')) return null;
+      return Number(el.value);
+    }
+    function modemConfig(slot) {
+      var list = webConfig && Array.isArray(webConfig.modems) ? webConfig.modems : [];
+      return (slot === 0 || slot === 1) ? (list[slot] || {}) : {};
+    }
+    function simSlotChange() {
+      var slot = selectedSlot('simSlot'); if (slot == null) return;
+      var m = modemConfig(slot), el;
+      el = document.getElementById('simDataEnabled'); if (el) el.checked = !!m.dataEnabled;
+      el = document.getElementById('simRoamingEnabled'); if (el) el.checked = m.roamingEnabled !== false;
+      el = document.getElementById('simApn'); if (el) el.value = m.apn || '';
+      el = document.getElementById('simOperatorPlmn'); if (el) el.value = m.operatorPlmn || '';
+      el = document.getElementById('simPhoneNumber'); if (el) el.value = m.phoneNumber || '';
+      loadStatus();
+    }
+    function netLedSlotChange() {
+      var slot = selectedSlot('netLedSlot'); if (slot == null) return;
+      var el = document.getElementById('netLedEnabled');
+      if (el) el.checked = modemConfig(slot).netLedEnabled !== false;
+    }
+    function callNotifySlotChange() {
+      var slot = selectedSlot('callNotifySlot'); if (slot == null) return;
+      var el = document.getElementById('callNotifyEnabled');
+      if (el) el.checked = modemConfig(slot).callNotifyEnabled !== false;
     }
     function clearPanelTimers() {
       if (pingPollTimer) { clearTimeout(pingPollTimer); pingPollTimer = null; }
@@ -218,8 +248,9 @@
       if (name === 'inbox') loadMessages();
       if (name === 'keepalive' || name === 'diagnose') kaLoadStatus();
       if (name === 'keepalive') stLoadStatus();
-      if (name === 'sim') { wifiPrefill(); esimLoadStatus(); loadStatus(); startStatusPoll(); }
-      if (name === 'push') { for (var i = 0; i < 5; i++) { toggleChannel(i); updateTypeHint(i); } setupChannels(); parseFwdRules(); renderRules(); }
+      if (name === 'sim') { simSlotChange(); wifiPrefill(); esimLoadStatus(); loadStatus(); startStatusPoll(); }
+      if (name === 'push') { callNotifySlotChange(); for (var i = 0; i < 5; i++) { toggleChannel(i); updateTypeHint(i); } setupChannels(); parseFwdRules(); renderRules(); }
+      if (name === 'settings') netLedSlotChange();
       if (name === 'atterm') bindAtTerminal();
     }
     function activateNav(name) {
@@ -488,13 +519,13 @@
       if (kg) kg.style.display = 'none';
       if (bp) bp.style.display = '';
       if (ba) ba.style.display = 'none';
-      if (type == 1) hint.innerHTML = 'POST JSON<br>{"sender":"+447700900123","receiver":"+447700900456","message":"...","timestamp":"2026-01-01 12:00:00"}';
+      if (type == 1) hint.innerHTML = 'POST JSON<br>{"slot":0,"sender":"+447700900123","receiver":"+447700900456","message":"...","timestamp":"2026-01-01 12:00:00"}';
       else if (type == 2) { hint.innerHTML = 'Bark (iOS)<br>URL 留空使用 https://api.day.app；自建填服务器根地址，设备端发送到 /push。'; extra.style.display='block'; if(kg)kg.style.display='none'; if(ba)ba.style.display='block'; document.getElementById('urllabel'+idx).innerText='Bark 服务器 URL'; document.getElementById('url'+idx).placeholder='留空=官方服务；自建=https://bark.example.com'; document.getElementById('key1label'+idx).innerText='Device Key'; document.getElementById('key1'+idx).placeholder='Bark App 中显示的 key'; bindBarkParams(idx); loadBarkParams(idx); serializeBarkParams(idx); }
-      else if (type == 3) hint.innerHTML = 'GET 请求<br>URL?sender=xxx&receiver=xxx&message=xxx&timestamp=xxx';
+      else if (type == 3) hint.innerHTML = 'GET 请求<br>URL?sender=xxx&receiver=xxx&slot=0&message=xxx&timestamp=xxx';
       else if (type == 4) { hint.innerHTML = '钉钉机器人<br>填写 Webhook 地址，加签需填 Secret'; extra.style.display='block'; document.getElementById('key1label'+idx).innerText='Secret（加签密钥，可选）'; document.getElementById('key1'+idx).placeholder='SEC...'; }
       else if (type == 5) { hint.innerHTML = 'PushPlus<br>填写 Token，URL 留空使用默认'; extra.style.display='block'; document.getElementById('key1label'+idx).innerText='Token'; document.getElementById('key1'+idx).placeholder='pushplus token'; if(kg)kg.style.display='block'; document.getElementById('key2label'+idx).innerText='发送渠道'; document.getElementById('key2'+idx).placeholder='wechat / extension / app'; }
       else if (type == 6) { hint.innerHTML = 'Server酱<br>填写 SendKey，URL 留空使用默认'; extra.style.display='block'; document.getElementById('key1label'+idx).innerText='SendKey'; document.getElementById('key1'+idx).placeholder='SCT...'; }
-      else if (type == 7) { hint.innerHTML = '自定义模板<br>使用 {sender} {receiver} {local_number} {message} {timestamp} 占位符'; custom.style.display='block'; }
+      else if (type == 7) { hint.innerHTML = '自定义模板<br>使用 {slot} {sender} {receiver} {local_number} {message} {timestamp} 占位符'; custom.style.display='block'; }
       else if (type == 8) { hint.innerHTML = '飞书机器人<br>填写 Webhook 地址，签名验证需填 Secret'; extra.style.display='block'; document.getElementById('key1label'+idx).innerText='Secret（签名密钥，可选）'; document.getElementById('key1'+idx).placeholder='飞书签名密钥'; }
       else if (type == 9) { hint.innerHTML = 'Gotify<br>填写服务器地址 + 应用 Token'; extra.style.display='block'; document.getElementById('key1label'+idx).innerText='Token（应用 Token）'; document.getElementById('key1'+idx).placeholder='A...'; }
       else if (type == 10) { hint.innerHTML = 'Telegram Bot<br>Chat ID（参数1）+ Bot Token（参数2）'; extra.style.display='block'; document.getElementById('key1label'+idx).innerText='Chat ID'; document.getElementById('key1'+idx).placeholder='123456789'; if(kg)kg.style.display='block'; document.getElementById('key2label'+idx).innerText='Bot Token'; document.getElementById('key2'+idx).placeholder='12345678:ABC...'; }
@@ -567,10 +598,12 @@
       });
     }
     function testPush(idx, btn) {
+      var slot = selectedSlot('pushTestSlot');
+      if (slot == null) { showToast('请选择卡槽', 'err'); return; }
       if (btn) { pushTestBtns[idx] = btn; btn.disabled = true; }  // 测试期间防重复点击
       var r = document.getElementById('pushTestResult' + idx);
       r.className = 'result-box result-loading'; r.textContent = '测试推送已提交（请先保存配置）...';
-      csrfFetch('/testpush?ch=' + idx, { method: 'POST', cache: 'no-store' }).then(jsonOrThrow).then(function(d) {
+      csrfFetch('/testpush?ch=' + idx + '&slot=' + slot, { method: 'POST', cache: 'no-store' }).then(jsonOrThrow).then(function(d) {
         if (d.success && d.queued) {
           r.textContent = d.message || '后台测试推送中...';
           pollTestPush(idx);
@@ -584,11 +617,12 @@
 
     // ---- USSD ----
     function sendUssd() {
+      var slot = selectedSlot('diagSlot'); if (slot == null) return;
       var code = document.getElementById('ussdCode').value.trim();
       if (!code) return;
       var r = document.getElementById('ussdResult');
       r.className = 'result-box result-loading'; r.textContent = '查询中（最长约 20 秒）...';
-      csrfFetch('/ussd?code=' + encodeURIComponent(code), { method: 'POST', cache: 'no-store' }).then(jsonOrThrow).then(function(d) {
+      csrfFetch('/ussd?code=' + encodeURIComponent(code) + '&slot=' + slot, { method: 'POST', cache: 'no-store' }).then(jsonOrThrow).then(function(d) {
         r.className = 'result-box ' + (d.success ? 'result-info' : 'result-error');
         r.textContent = d.message || '(无响应)';
       }).catch(function(e){ r.className = 'result-box result-error'; r.textContent = '请求失败: ' + e; });
@@ -613,13 +647,15 @@
       var phoneEl = document.getElementById('smsPhone'), contentEl = document.getElementById('smsContent');
       var r = document.getElementById('smsSendResult');
       if (!phoneEl || !contentEl || !r) return;
+      var slot = selectedSlot('smsSlot');
+      if (slot == null) { r.className = 'result-box result-error'; r.textContent = '请选择发送卡槽'; return; }
       var phone = phoneEl.value.trim();
       var content = contentEl.value;
       if (!phone) { r.className = 'result-box result-error'; r.textContent = '请输入目标号码'; return; }
       if (!content.trim()) { r.className = 'result-box result-error'; r.textContent = '请输入短信内容'; return; }
       var btn = document.getElementById('smsSendBtn'); btn.disabled = true;
       r.className = 'result-box result-loading'; r.textContent = '提交中...';
-      var body = 'phone=' + encodeURIComponent(phone) + '&content=' + encodeURIComponent(content);
+      var body = 'slot=' + slot + '&phone=' + encodeURIComponent(phone) + '&content=' + encodeURIComponent(content);
       csrfFetch('/sendsms', { method: 'POST', cache: 'no-store', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
         .then(jsonOrThrow).then(function(d) {
           btn.disabled = false;
@@ -640,10 +676,11 @@
       var b=document.getElementById('pingBtn'),r=document.getElementById('pingResult');
       var u=document.getElementById('pingUrl');
       if(!b||!r||!u)return;
+      var slot=selectedSlot('diagSlot');if(slot==null)return;
       var url=(u.value||'').trim();
       b.disabled=true;b.textContent='...';
       r.className='result-box result-loading';r.textContent='提交 payload 下载任务...';
-      csrfFetch('/ping',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(url)}).then(jsonOrThrow).then(function(d){
+      csrfFetch('/ping',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'slot='+slot+'&url='+encodeURIComponent(url)}).then(jsonOrThrow).then(function(d){
         if(d.success && d.running){ r.textContent='后台下载 payload 中（会短暂开启蜂窝数据）...'; pollPingStatus(); }
         else{ b.disabled=false;b.textContent='下载 payload'; r.className='result-box result-error'; r.textContent=d.message||'任务启动失败'; }
       }).catch(function(e){b.disabled=false;b.textContent='下载 payload';r.className='result-box result-error';r.textContent='请求失败: '+e;});
@@ -682,18 +719,20 @@
 
     // ---- Flight Mode ----
     function queryFlightMode(){
+      var slot=selectedSlot('diagSlot');if(slot==null)return;
       var r=document.getElementById('flightResult');
       r.className='result-box result-loading';r.textContent='查询中...';
-      fetch('/flight?action=query',{cache:'no-store'}).then(jsonOrThrow).then(function(d){
+      fetch('/flight?action=query&slot='+slot,{cache:'no-store'}).then(jsonOrThrow).then(function(d){
         if(d.success){r.className='result-box result-info';r.textContent=d.message;}
         else{r.className='result-box result-error';r.textContent='查询失败: '+d.message;}
       }).catch(function(e){r.className='result-box result-error';r.textContent='请求失败: '+e;});
     }
     function toggleFlightMode(){
+      var slot=selectedSlot('diagSlot');if(slot==null)return;
       if(!confirm('确定要切换飞行模式吗？'))return;
       var b=document.getElementById('flightBtn'),r=document.getElementById('flightResult');
       b.disabled=true;r.className='result-box result-loading';r.textContent='切换中...';
-      csrfFetch('/flight?action=toggle',{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
+      csrfFetch('/flight?action=toggle&slot='+slot,{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
         b.disabled=false;
         if(d.success){r.className='result-box result-success';r.textContent=d.message;}
         else{r.className='result-box result-error';r.textContent='切换失败: '+d.message;}
@@ -714,19 +753,20 @@
 
     // ---- Modem Control ----
     function modemAction(action){
+      var slot=selectedSlot('diagSlot');if(slot==null)return;
       var names={'restart':'软重启','hardreset':'硬重启'};
       var name=names[action]||action;
       var resultEl=document.getElementById('modemRstResult');   // 仅 restart/hardreset 调用本函数
       if(action==='hardreset'){
         if(!confirm('硬重启将断电重启模组，确定继续？'))return;
         resultEl.className='result-box result-loading';resultEl.textContent='硬重启中（约10秒）...';
-        csrfFetch('/modem?action=hardreset',{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
+        csrfFetch('/modem?action=hardreset&slot='+slot,{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
           resultEl.className='result-box result-success';resultEl.textContent=d.message+' — 稍后请手动查询信号确认恢复';
         }).catch(function(e){resultEl.className='result-box result-error';resultEl.textContent='请求失败: '+e;});
         return;
       }
       resultEl.className='result-box result-loading';resultEl.textContent=name+'中...';
-      csrfFetch('/modem?action='+action,{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
+      csrfFetch('/modem?action='+action+'&slot='+slot,{method:'POST',cache:'no-store'}).then(jsonOrThrow).then(function(d){
         if(d.success){
           resultEl.className='result-box result-success';resultEl.textContent=name+'成功: '+d.message;
         }
@@ -749,13 +789,14 @@
     var atHistory=[],atHistPos=-1,atDraft='';
     function sendAT(){
       var inp=document.getElementById('atCmd');if(!inp)return;var cmd=inp.value.trim();if(!cmd)return;
+      var slot=selectedSlot('atSlot');if(slot==null)return;
       var btn=document.getElementById('atBtn');
       if(btn&&btn.disabled)return;  // 上一条还在执行(含快捷指令入口)，避免并发 /at 请求堆积拖垮 httpd
       if(atHistory[atHistory.length-1]!==cmd){atHistory.push(cmd);if(atHistory.length>30)atHistory.shift();}
       atHistPos=-1;atDraft='';
       btn.disabled=true;btn.textContent='...';
       addLog(cmd,'user');inp.value='';
-      csrfFetch('/at?cmd='+encodeURIComponent(cmd), { method: 'POST', cache: 'no-store' }).then(jsonOrThrow).then(function(d){
+      csrfFetch('/at?cmd='+encodeURIComponent(cmd)+'&slot='+slot, { method: 'POST', cache: 'no-store' }).then(jsonOrThrow).then(function(d){
         addLog(d.message,d.success?'resp':'error');
       }).catch(function(e){addLog('网络错误: '+e,'error')}).finally(function(){btn.disabled=false;btn.textContent='发送';});
     }
@@ -916,6 +957,7 @@
     }
     function kaLoadStatus() {
       fetch('/keepalive?action=status&_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(d) {
+        var slotEl = document.getElementById('kaSlot'); if (slotEl) slotEl.value = String(d.slot);
         var el = document.getElementById('kaEnabled'); if (el) el.checked = !!d.enabled;
         el = document.getElementById('kaIntervalDays'); if (el) el.value = d.intervalDays;
         el = document.getElementById('kaAction'); if (el) el.value = d.action;
@@ -981,7 +1023,9 @@
       showToast('正在保存并提交保号任务…', 'loading');
       kaSaveForm().then(function(saved) {
         if (!saved) { showToast('保存失败，未执行', 'err'); return; }
-        csrfFetch('/keepalive?action=run', {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d) {
+        var slot = selectedSlot('kaSlot');
+        if (slot == null) { showToast('请选择卡槽', 'err'); return; }
+        csrfFetch('/keepalive?action=run&slot=' + slot, {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d) {
           if (d.success && d.queued) { showToast(d.message || '保号动作已排队', 'loading'); kaPollRunStatus(); }
           else { showToast(d.message || '任务启动失败', 'err'); }
         }).catch(function(e){ showToast('请求失败: ' + e, 'err'); });
@@ -1069,7 +1113,10 @@
             '<div class="form-group"><label>周期（天）</label><input type="number" name="st' + i + 'Days" id="st' + i + 'Days" min="1" max="3650" value="30"></div>' +
           '</div>' +
           '<div class="form-row">' +
+            '<div class="form-group"><label>目标卡槽</label><select name="st' + i + 'Slot" id="st' + i + 'Slot"><option value="0">卡槽 1</option><option value="1">卡槽 2</option></select></div>' +
             '<div class="form-group"><label>动作</label><select name="st' + i + 'Act" id="st' + i + 'Act"><option value="0">推送自定义提醒</option><option value="1">蜂窝 HTTP 下载(ping)</option><option value="2">发送短信</option><option value="3">USSD 查询</option></select></div>' +
+          '</div>' +
+          '<div class="form-row">' +
             '<div class="form-group"><label>目标 eSIM Profile</label><input type="hidden" name="st' + i + 'Prof" id="st' + i + 'Prof"><select id="st' + i + 'ProfSel" onchange="profSelChange(&quot;st' + i + 'Prof&quot;)"></select><input type="text" id="st' + i + 'ProfCustom" maxlength="64" placeholder="手动输入 ICCID/别名" style="display:none;margin-top:8px;" oninput="profSelChange(&quot;st' + i + 'Prof&quot;)"></div>' +
           '</div>' +
           '<div class="form-group"><label>目标（URL / 号码 / USSD 码；HTTP 留空用保号 URL）</label><input type="text" name="st' + i + 'Tgt" id="st' + i + 'Tgt" maxlength="128"></div>' +
@@ -1111,6 +1158,7 @@
       if (!confirm('删除任务 ' + (i + 1) + '？点击“保存自定义任务”后生效。')) return;
       ['Name', 'Tgt', 'Pay', 'Prof', 'ProfCustom'].forEach(function(sfx){ var el = document.getElementById('st' + i + sfx); if (el) el.value = ''; });
       var el = document.getElementById('st' + i + 'Days'); if (el) el.value = 30;
+      el = document.getElementById('st' + i + 'Slot'); if (el) el.value = 0;
       el = document.getElementById('st' + i + 'Act'); if (el) el.value = 0;
       el = document.getElementById('st' + i + 'En'); if (el) el.checked = false;
       el = document.getElementById('st' + i + 'Back'); if (el) el.checked = true;
@@ -1148,6 +1196,7 @@
             var el = document.getElementById('st' + i + 'En'); if (el) el.checked = !!t.enabled;
             el = document.getElementById('st' + i + 'Back'); if (el) el.checked = !!t.switchBack;
             stSetVal('st' + i + 'Name', t.name); stSetVal('st' + i + 'Days', t.intervalDays);
+            stSetVal('st' + i + 'Slot', t.slot);
             stSetVal('st' + i + 'Act', t.action);
             stSetVal('st' + i + 'Tgt', t.target); stSetVal('st' + i + 'Pay', t.payload);
             profInit('st' + i + 'Prof', t.profile || '');
@@ -1197,7 +1246,9 @@
       showToast('正在保存并提交任务…', 'loading');
       stSaveForm().then(function(saved) {
         if (!saved) { showToast('保存失败，未执行', 'err'); return; }
-        csrfFetch('/schedtask?action=run&index=' + i, {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d) {
+        var slot = selectedSlot('st' + i + 'Slot');
+        if (slot == null) { showToast('请选择卡槽', 'err'); return; }
+        csrfFetch('/schedtask?action=run&index=' + i + '&slot=' + slot, {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d) {
           if (d.success) { showToast(d.message || '任务已排队', 'loading'); stLoadStatus(true); }
           else { showToast(d.message || '任务启动失败', 'err'); }
         }).catch(function(e){ showToast('请求失败: ' + e, 'err'); });
@@ -1213,8 +1264,9 @@
 
     // ---- NET 指示灯临时开关 ----
     function netLedTemp(on) {
+      var slot = selectedSlot('netLedSlot'); if (slot == null) return;
       showToast((on ? '正在开启' : '正在关闭') + ' NET 指示灯…', 'loading');
-      csrfFetch('/netled?action=' + (on ? 'on' : 'off'), {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d) {
+      csrfFetch('/netled?action=' + (on ? 'on' : 'off') + '&slot=' + slot, {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d) {
         showToast(d.message || (d.success ? (on ? 'NET 灯已开启' : 'NET 灯已关闭') : '操作失败'), d.success ? 'ok' : 'err');
       }).catch(function(e){ showToast('请求失败: ' + e, 'err'); });
     }
@@ -1240,7 +1292,7 @@
     function signalPendingText(d) {
       if (!d || !d.signalFresh) {
         if (d && d.modemInitPhase === 'sampling') return modemPhaseText(d);
-        if (Date.now() < modemSampleUntil) return '采样中';
+        if (d && Date.now() < modemSampleUntil[d.slot]) return '采样中';
         return d && d.modemReady ? '未刷新' : modemPhaseText(d);
       }
       if (!d.modemReady && d.modemInitPhase !== 'ready') return '注册中';
@@ -1253,13 +1305,13 @@
       return (!d || d.csq == null || d.csq >= 99 || d.csq < 0) ? signalPendingText(d) : fmtCsq(d.csq);
     }
     function pendingValue(v, fresh, d) {
-      return v || ((d && d.modemInitPhase === 'sampling') ? '读取中' : (fresh ? '--' : (Date.now() < modemSampleUntil ? '采样中' : '未刷新')));
+      return v || ((d && d.modemInitPhase === 'sampling') ? '读取中' : (fresh ? '--' : (d && Date.now() < modemSampleUntil[d.slot] ? '采样中' : '未刷新')));
     }
     function apnText(d) {
       if (d.apnSim) return d.apnSim;
       if (d.apn) return d.apn;
       if (d && d.modemInitPhase === 'sampling') return '读取中';
-      if (Date.now() < modemSampleUntil && !d.identityFresh) return '采样中';
+      if (Date.now() < modemSampleUntil[d.slot] && !d.identityFresh) return '采样中';
       if (!d.identityFresh && d.modemReady) return '未刷新';
       return '自动（运营商默认）';
     }
@@ -1288,18 +1340,41 @@
       return (m[v] || '原因码') + ' (' + v + ')';
     }
     function kb(b) { return Math.round(b / 1024) + ' KB'; }
-    // 信号量表填充：raw 映射到 lo..hi 百分比，按 warnAt/okAt 染色(越大越好)
-    function setGauge(id, raw, lo, hi, label, warnAt, okAt) {
-      var fill = document.getElementById(id), vEl = document.getElementById(id + 'V');
-      if (vEl) vEl.textContent = label;
-      if (!fill) return;
-      var bad = (raw == null || raw === 999 || raw < -200 || (lo === 0 && hi === 31 && raw >= 99));
-      if (bad) { fill.style.width = '0'; fill.className = 'fill'; return; }
-      var pct = Math.max(2, Math.min(100, (raw - lo) / (hi - lo) * 100));
-      fill.style.width = pct + '%';
-      fill.className = 'fill ' + (raw >= okAt ? 'ok' : raw >= warnAt ? 'warn' : 'bad');
+    var simLockNames = {ready:'SIM 已就绪', pin:'SIM 正在等待 PIN', puk:'SIM 正在等待 PUK', absent:'未检测到 SIM', other:'SIM 处于不支持的锁定状态', unknown:'SIM 状态未知'};
+    function simLockText(d) {
+      return (simLockNames[d.simState] || d.simState || 'SIM 状态未知') +
+        (d.simCredentialMatched ? '；已匹配 ICCID 凭据' : '') +
+        (d.simUnlockMessage ? '；' + d.simUnlockMessage : '');
     }
-    var statusTimer = null, statusPolling = false, statusSeq = 0, statusAbort = null, statusLoading = false, statusFailCount = 0, devEpochBase = 0, devEpochBaseMs = 0, latestStatusKey = '', statusFastUntil = 0, modemSampleUntil = 0;
+    function renderModemOverview(modems) {
+      var box = document.getElementById('modemOverviewCards'); if (!box) return;
+      var html = '';
+      modems.forEach(function(m) {
+        var slot = Number(m.slot);
+        var cell = m.dataEnabled ? (m.cellIp || '获取中') : '— (未启用)';
+        var op = m.operator || (m.modemInitPhase === 'sampling' ? '读取中' : (m.modemReady ? '未刷新' : modemPhaseText(m)));
+        html += '<div class="card"><div class="card-header">卡槽 ' + (slot + 1) +
+          '<button type="button" class="btn btn-secondary btn-sm" style="margin-left:auto;" onclick="refreshModemInfo(' + slot + ',this)">刷新模组信息</button></div><div class="card-body"><table class="info-table">' +
+          '<tr><td>模组状态</td><td>' + htmlEsc(modemPhaseText(m)) + '</td></tr>' +
+          '<tr><td>SIM 状态</td><td>' + htmlEsc(simLockText(m)) + '</td></tr>' +
+          '<tr><td>运营商 / 注册</td><td>' + htmlEsc(op + ' · CEREG ' + m.ceregStat) + '</td></tr>' +
+          '<tr><td>CSQ / RSSI</td><td>' + htmlEsc(fmtCsqStatus(m) + ' · ' + fmtRssiStatus(m)) + '</td></tr>' +
+          '<tr><td>RSRP / RSRQ / SINR</td><td>' + htmlEsc(fmtRsrp(m.rsrp) + ' / ' + fmtDb(m.rsrq) + ' / ' + fmtDb(m.sinr)) + '</td></tr>' +
+          '<tr><td>蜂窝数据 / IP</td><td>' + htmlEsc((m.dataEnabled ? '已启用 · ' : '已禁用 · ') + cell) + '</td></tr>' +
+          '<tr><td>制造商 / 型号</td><td>' + htmlEsc(pendingValue(m.mfr, m.identityFresh, m) + ' / ' + pendingValue(m.model, m.identityFresh, m)) + '</td></tr>' +
+          '<tr><td>模组固件</td><td>' + htmlEsc(pendingValue(m.fwver, m.identityFresh, m)) + '</td></tr>' +
+          '<tr><td>本机号码</td><td>' + htmlEsc(m.phone || '--') + '</td></tr>' +
+          '<tr><td>IMEI</td><td>' + htmlEsc(pendingValue(m.imei, m.identityFresh, m)) + '</td></tr>' +
+          '<tr><td>ICCID</td><td>' + htmlEsc(pendingValue(m.iccid, m.identityFresh, m)) + '</td></tr>' +
+          '<tr><td>IMSI</td><td>' + htmlEsc(pendingValue(m.imsi, m.identityFresh, m)) + '</td></tr>' +
+          '<tr><td>APN</td><td>' + htmlEsc(apnText(m)) + '</td></tr>' +
+          '<tr><td>短信 / 待发</td><td>' + Number(m.smsTotal || 0) + ' / ' + Number(m.outQueueDepth || 0) + '</td></tr>' +
+          '<tr><td>Modem / SMS 栈余量</td><td>' + kb(Number(m.modemStackFree || 0)) + ' / ' + kb(Number(m.smsStackFree || 0)) + '</td></tr>' +
+          '</table></div></div>';
+      });
+      box.innerHTML = html;
+    }
+    var statusTimer = null, statusPolling = false, statusSeq = 0, statusAbort = null, statusLoading = false, statusFailCount = 0, devEpochBase = 0, devEpochBaseMs = 0, latestStatusKey = '', statusFastUntil = 0, modemSampleUntil = [0, 0];
     function deviceEpochNow() {
       if (!devEpochBase) return 0;
       return devEpochBase + Math.floor((Date.now() - devEpochBaseMs) / 1000);
@@ -1308,9 +1383,9 @@
       var ep = deviceEpochNow();
       if (ep) ovSet('ovRefresh', '设备 ' + fmtClockEpoch(ep));
     }
-    function loadStatus(sample) {
+    function loadStatus(sample, sampleSlot) {
       if (statusLoading) {
-        if (sample) setTimeout(function(){ loadStatus(true); }, 300);
+        if (sample) setTimeout(function(){ loadStatus(true, sampleSlot); }, 300);
         return;  // 上一次 /status 还没回来时不叠加请求，避免 ESP32 被轮询拖慢
       }
       statusLoading = true;
@@ -1331,7 +1406,7 @@
           statusLoading = false;
         }
       }, 7000);
-      var url = '/status?' + (sample ? 'sample=1&' : '') + '_=' + Date.now();
+      var url = '/status?' + (sample ? ('sample=1&slot=' + sampleSlot + '&') : '') + '_=' + Date.now();
       fetch(url, opt).then(jsonOrThrow).then(function(d) {
         if (seq !== statusSeq || timedOut) return;  // 旧响应直接丢弃，只显示最新状态
         statusFailCount = 0;
@@ -1341,21 +1416,18 @@
           devEpochBaseMs = Date.now();
           updateDeviceClockLabel();
         }
-        // KPI 指标条
-        setGauge('gCsq', d.csq, 0, 31, fmtCsqStatus(d), 8, 14);  // CSQ 原始值
-        setGauge('gRssi', (d.csq == null || d.csq >= 99) ? null : (-113 + 2 * d.csq), -110, -50, fmtRssiStatus(d), -95, -75);  // RSSI=CSQ 换算 dBm(与诊断"信号查询"一致)
-        var samplingNow = Date.now() < modemSampleUntil;
-        setGauge('gRsrp', d.rsrp, -120, -70, (samplingNow && (d.rsrp == null || d.rsrp >= 0 || d.rsrp === 999)) ? '采样中' : ((!d.modemReady && (d.rsrp == null || d.rsrp >= 0)) ? '注册后采样' : fmtRsrp(d.rsrp)), -110, -100);
-        setGauge('gRsrq', d.rsrq, -20, -3, (samplingNow && (d.rsrq == null || d.rsrq === 999)) ? '采样中' : ((!d.modemReady && (d.rsrq == null || d.rsrq === 999)) ? '注册后采样' : fmtDb(d.rsrq)), -15, -10);
-        setGauge('gSinr', d.sinr, 0, 30, (samplingNow && (d.sinr == null || d.sinr === 999)) ? '采样中' : ((!d.modemReady && (d.sinr == null || d.sinr === 999)) ? '注册后采样' : fmtDb(d.sinr)), 0, 13);
-        setGauge('gWifi', (d.rssi == null || d.rssi >= 0) ? null : d.rssi, -90, -40, (d.rssi == null || d.rssi >= 0) ? '--' : (d.rssi + ' dBm'), -75, -65);  // WiFi RSSI(质量见下方卡片)
-        ovSet('ovData', d.dataEnabled ? '已启用' : '已禁用');
-        ovSet('ovDataSub', d.dataEnabled ? (d.cellIp || '获取中') : '零流量');
-        ovSet('ovSms', d.smsTotal); ovSet('ovLastSms', '最近 ' + fmtEpoch(d.lastSmsEpoch));
+        var modems = Array.isArray(d.modems) ? d.modems : [];
+        renderModemOverview(modems);
+        var dataModems = modems.filter(function(m){ return !!m.dataEnabled; });
+        var smsTotal = modems.reduce(function(n, m){ return n + Number(m.smsTotal || 0); }, 0);
+        var lastSmsEpoch = modems.reduce(function(n, m){ return Math.max(n, Number(m.lastSmsEpoch || 0)); }, 0);
+        ovSet('ovData', dataModems.length + ' / 2 已启用');
+        ovSet('ovDataSub', dataModems.length ? dataModems.map(function(m){ return '卡槽' + (Number(m.slot) + 1) + ' ' + (m.cellIp || '获取中'); }).join(' · ') : '零流量');
+        ovSet('ovSms', smsTotal); ovSet('ovLastSms', '最近 ' + fmtEpoch(lastSmsEpoch));
         ovSet('ovInbox', d.inboxCount + ' 条');
         var busyQueues = !!(d.slowBusy || d.fwdQueueDepth || d.queueDepth || d.outSmsQueueDepth || d.emailQueueDepth);
         if (busyQueues) statusFastUntil = Date.now() + 12000;
-        var lk = [d.smsTotal, d.lastSmsEpoch, d.inboxCount, d.fwdQueueDepth, d.queueDepth, d.slowBusy ? 1 : 0].join(':');
+        var lk = [smsTotal, lastSmsEpoch, d.inboxCount, d.fwdQueueDepth, d.queueDepth, d.slowBusy ? 1 : 0].join(':');
         if (lk !== latestStatusKey) {
           latestStatusKey = lk;
           loadLatestOtp();
@@ -1364,19 +1436,12 @@
         ovSet('dvHeap', kb(d.freeHeap) + ' · 最低 ' + kb(d.minFreeHeap));
         window.__upt = d.uptime; ovSet('dvUptime', fmtUptime(d.uptime)); ovSet('dvEspVer', d.version);
         ovSet('dvTemp', (d.chipTemp != null ? d.chipTemp + ' ℃' : '--'));
-        ovSet('dvMfr', pendingValue(d.mfr, d.identityFresh, d)); ovSet('dvModel', pendingValue(d.model, d.identityFresh, d)); ovSet('dvFw', pendingValue(d.fwver, d.identityFresh, d));
-        // SIM 卡信息
-        ovSet('tOp', d.operator || (d.modemInitPhase === 'sampling' ? '读取中' : (d.modemReady ? '未刷新' : modemPhaseText(d)))); ovSet('tModem', modemPhaseText(d));
-        ovSet('tCellIp', d.dataEnabled ? (d.cellIp || '获取中') : '— (未启用)');
-        ovSet('tPhone', d.phone || '--'); ovSet('tImei', pendingValue(d.imei, d.identityFresh, d)); ovSet('tIccid', pendingValue(d.iccid, d.identityFresh, d));
-        ovSet('tImsi', pendingValue(d.imsi, d.identityFresh, d)); ovSet('tApn', apnText(d));
         var simLock = document.getElementById('simLockStatus');
         if (simLock) {
-          var lockNames = {ready:'SIM 已就绪', pin:'SIM 正在等待 PIN', puk:'SIM 正在等待 PUK', absent:'未检测到 SIM', other:'SIM 处于不支持的锁定状态', unknown:'SIM 状态未知'};
-          simLock.textContent = (lockNames[d.simState] || d.simState || 'SIM 状态未知') +
-            (d.simCredentialMatched ? '；已匹配 ICCID 凭据' : '') +
-            (d.simUnlockMessage ? '；' + d.simUnlockMessage : '');
-          simLock.className = 'result-box ' + (d.simState === 'ready' ? 'result-success' : (d.simState === 'pin' || d.simState === 'puk' ? 'result-error' : 'result-info'));
+          var simSlot = selectedSlot('simSlot');
+          var simModem = modems[simSlot == null ? 0 : simSlot] || {};
+          simLock.textContent = simLockText(simModem);
+          simLock.className = 'result-box ' + (simModem.simState === 'ready' ? 'result-success' : (simModem.simState === 'pin' || simModem.simState === 'puk' ? 'result-error' : 'result-info'));
         }
         // WiFi 详细信息卡片(独立卡，原"网络与SIM"里的 WiFi 行已移出)
         ovSet('wfSsid', d.ssid || '--');
@@ -1434,13 +1499,13 @@
       }, 1000);
     }
     function stopStatusPoll() { statusPolling = false; if (statusTimer) { clearTimeout(statusTimer); statusTimer = null; } }
-    function refreshModemInfo(btn) {
+    function refreshModemInfo(slot, btn) {
       var old = btn ? btn.textContent : '';
       if (btn) { btn.disabled = true; btn.textContent = '采样中...'; }
       ovSet('ovRefresh', '正在采样...');
-      modemSampleUntil = Date.now() + 15000;
+      modemSampleUntil[slot] = Date.now() + 15000;
       statusFastUntil = Date.now() + 15000;
-      loadStatus(true);
+      loadStatus(true, slot);
       [700, 1500, 2500, 4000].forEach(function(delay) {
         setTimeout(function() { if (panelActive('overview')) loadStatus(); }, delay);
       });
@@ -1508,7 +1573,7 @@
       var qEl = document.getElementById('smsSearch');
       var q = (qEl && qEl.value || '').trim().toLowerCase();
       var arr = (window.__msgFull || []).slice();
-      if (q) arr = arr.filter(function(m){ var who = sent ? (m.target||'') : (m.sender||''); return (who + ' ' + (m.text||'')).toLowerCase().indexOf(q) >= 0; });
+      if (q) arr = arr.filter(function(m){ var who = sent ? (m.target||'') : (m.sender||''); return (who + ' ' + (m.text||'') + ' 卡槽' + (Number(m.slot) + 1)).toLowerCase().indexOf(q) >= 0; });
       box.innerHTML = '';
       if (!arr.length) {
         var em = document.createElement('div'); em.className = 'msg-empty';
@@ -1527,6 +1592,7 @@
             right.appendChild(oc);
           }
           var chip = document.createElement('span'); chip.className = 'msg-chip';
+          var slotChip = document.createElement('span'); slotChip.className = 'msg-chip'; slotChip.textContent = '卡槽 ' + (Number(m.slot) + 1);
           if (sent) {
             s.textContent = m.target || '(未知)';
             chip.textContent = m.ok ? '发送成功' : '发送失败'; chip.className += m.ok ? ' ok' : ' bad';
@@ -1534,7 +1600,7 @@
             s.textContent = m.sender || '(未知)';
             chip.textContent = m.fwd ? '已处理' : '待处理'; chip.className += m.fwd ? ' ok' : ' wait';
           }
-          right.appendChild(chip);
+          right.appendChild(slotChip); right.appendChild(chip);
           h.appendChild(s); h.appendChild(right);
           var t = document.createElement('div'); t.className = 'msg-time';
           t.textContent = fmtEpoch(sent ? m.sent : m.recv);
@@ -1568,8 +1634,9 @@
 
     // ---- eSIM 本地管理 ----
     function simPukUnlock() {
+      var slot = selectedSlot('simSlot'); if (slot == null) return;
       if (!confirm('PUK 输错可能永久锁死 SIM。确认使用当前 ICCID 已保存的 PUK，并把已保存 PIN 设置为新 PIN？')) return;
-      csrfFetch('/modem?action=sim-puk', {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d){
+      csrfFetch('/modem?action=sim-puk&slot=' + slot, {method:'POST', cache:'no-store'}).then(jsonOrThrow).then(function(d){
         showToast(d.message || 'PUK 解锁请求已提交', d.success ? 'ok' : 'err');
         loadStatus();
       }).catch(function(e){ showToast('PUK 解锁请求失败: ' + e, 'err'); });
@@ -1958,7 +2025,7 @@
       box.innerHTML = '';
       fwdRules.forEach(function(r, i) {
         var d = document.createElement('div'); d.className = 'push-channel enabled'; d.style.marginBottom = '10px';
-        var typeOpts = [['kw','关键词(子串)'],['re','正文正则'],['from','发件人正则']].map(function(o){return '<option value="'+o[0]+'"'+(r.type===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('');
+        var typeOpts = [['slot','卡槽'],['kw','关键词(子串)'],['re','正文正则'],['from','发件人正则']].map(function(o){return '<option value="'+o[0]+'"'+(r.type===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('');
         var chans = ''; for (var c = 1; c <= 5; c++) chans += '<label style="margin-right:12px;font-size:12px;white-space:nowrap;"><input type="checkbox" data-ch="'+c+'"'+(r.chans[c]?' checked':'')+(r.drop?' disabled':'')+'> '+htmlEsc(chanName(c))+'</label>';
         d.innerHTML =
           '<div class="push-channel-header"><b style="font-family:var(--mono);color:var(--amber);">'+(i+1<10?'0':'')+(i+1)+'</b>'+
@@ -1968,7 +2035,7 @@
           '<button type="button" class="btn btn-secondary btn-sm" data-a="dn">↓</button>'+
           '<button type="button" class="btn btn-danger btn-sm" data-a="del">删除</button></span></div>'+
           '<div class="form-row"><div class="form-group" style="flex:0 0 132px;"><label class="form-label">匹配方式</label><select class="form-select rType">'+typeOpts+'</select></div>'+
-          '<div class="form-group"><label class="form-label">模式（关键词 / 正则）</label><input class="form-input rPat" placeholder="如  验证码   或   ^(10086|10010)"></div></div>'+
+          '<div class="form-group"><label class="form-label">模式（卡槽填 0/1）</label><input class="form-input rPat" placeholder="卡槽填 0/1；其余填关键词或正则"></div></div>'+
           '<div class="form-group"><label class="form-label">命中后</label>'+
           '<label style="margin-right:14px;font-size:12px;color:var(--error);"><input type="checkbox" class="rDrop"'+(r.drop?' checked':'')+'> 丢弃(不转发)</label>'+
           '<label style="margin-right:12px;font-size:12px;"><input type="checkbox" class="rEmail"'+(r.email?' checked':'')+(r.drop?' disabled':'')+'> 邮件</label>'+chans+'</div>';
@@ -2007,13 +2074,15 @@
       serializeRules();
       var from = (document.getElementById('rtFrom').value || '').trim();
       var text = document.getElementById('rtText').value || '';
+      var slot = (document.getElementById('rtSlot').value || '0').trim();
       var r = document.getElementById('rtResult');
-      if (!text && !from) { r.className = 'result-box result-error'; r.textContent = '请先填写测试发件人或正文'; return; }
       for (var i = 0; i < fwdRules.length; i++) {
         var rule = fwdRules[i];
         if (!rule.enabled || !rule.pattern) continue;
         var hit = false;
-        if (rule.type === 'kw') {
+        if (rule.type === 'slot') {
+          hit = rule.pattern === slot;
+        } else if (rule.type === 'kw') {
           hit = text.indexOf(rule.pattern) >= 0;
         } else {
           try { hit = new RegExp(rule.pattern, 'i').test(rule.type === 'from' ? from : text); }
@@ -2054,6 +2123,7 @@
       var h = '<div class="dk">' + (sent ? '目标' : '发件人') + '</div>' +
               '<div class="dv">' + htmlEsc(who) + ' <span class="msg-chip" id="drawerCopyWho" style="cursor:pointer;">复制号码</span></div>';
       h += '<div class="dk">时间</div><div class="dv">' + fmtEpochFull(sent ? m.sent : m.recv) + '</div>';
+      h += '<div class="dk">卡槽</div><div class="dv">卡槽 ' + (Number(m.slot) + 1) + '</div>';
       h += '<div class="dk">状态</div><div class="dv">' + (sent ? (m.ok ? '发送成功' : '发送失败') : (m.fwd ? '已处理' : '待处理')) + '</div>';
       h += '<div class="dk">正文长度</div><div class="dv">' + String((m.text || '').length) + ' 字符</div>';
       if (otp) h += '<div class="dk">验证码</div><div class="dv"><span class="otpcode" onclick="copyText(\'' + otp + '\', this)">' + otp + '</span></div>';

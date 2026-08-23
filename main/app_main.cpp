@@ -74,6 +74,12 @@ extern "C" void app_main(void)
     log_start_result("WiFi", idf_wifi_start(idf_config_get()));
     log_start_result("推送后台 worker", idf_push_start());
     log_start_result("HTTP 服务器", idf_web_start());
-    log_start_result("模组", idf_modem_start(idf_config_get()));
-    log_start_result("短信接收", idf_sms_start());
+    const IdfConfig& config = idf_config_get();
+    esp_err_t modem0 = idf_modem_start(0, config);
+    esp_err_t modem1 = idf_modem_start(1, config);
+    log_start_result("卡槽1模组", modem0);
+    log_start_result("卡槽2模组", modem1);
+    // UART/owner 资源创建失败时只跳过同槽 SMS worker；另一槽和共享服务继续运行。
+    if (modem0 == ESP_OK) log_start_result("卡槽1短信接收", idf_sms_start(0));
+    if (modem1 == ESP_OK) log_start_result("卡槽2短信接收", idf_sms_start(1));
 }

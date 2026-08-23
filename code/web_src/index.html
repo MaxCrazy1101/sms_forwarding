@@ -45,6 +45,7 @@
     <div class="modal-overlay" id="smsModal" onclick="if(event.target===this)closeSmsModal()">
       <div class="modal">
         <div class="modal-head"><span>发送短信</span><button class="modal-x" onclick="closeSmsModal()" aria-label="关闭">&times;</button></div>
+        <div class="form-group"><label class="form-label">发送卡槽</label><select class="form-select" id="smsSlot"><option value="0">卡槽 1</option><option value="1">卡槽 2</option></select></div>
         <div class="form-group"><label class="form-label">目标号码</label><input class="form-input" type="text" id="smsPhone" placeholder="+447700900456"></div>
         <div class="form-group"><label class="form-label">短信内容</label><textarea class="form-textarea" id="smsContent" placeholder="输入短信内容..." oninput="updateCount(this)"></textarea><p class="form-hint">已输入 <span id="charCount">0</span> 字符</p></div>
         <div class="result-box" id="smsSendResult"></div>

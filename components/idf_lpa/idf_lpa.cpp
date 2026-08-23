@@ -949,7 +949,7 @@ static bool build_authenticate_server_request(const LpaActivationCode& activatio
                                               std::string& message)
 {
     SensitiveText imei_text;
-    idf_modem_get_imei(imei_text.text);
+    idf_modem_get_imei(0, imei_text.text);
     std::array<uint8_t, 8> imei = {};
     if (!encode_imei_tbcd(imei_text.text, imei, message)) return false;
 

@@ -84,6 +84,7 @@ enum : uint8_t {
 
 struct PushJob {
     bool used = false;
+    uint8_t slot = 0;
     uint8_t channel = 0;
     uint8_t attempts = 0;
     bool notify = false;  // true=自定义提醒(标题即任务名,不套"短信来自"模板) false=转发短信
@@ -98,6 +99,7 @@ struct PushJob {
 struct ForwardJob {
     bool used = false;
     bool pushQueued = false;
+    uint8_t slot = 0;
     uint8_t attempts = 0;
     int64_t nextUs = 0;
     std::string sender;
@@ -124,6 +126,7 @@ struct ForwardCompletion {
 };
 
 struct TestJob {
+    uint8_t slot = 0;
     bool pending = false;
     bool running = false;
     bool done = false;
@@ -289,11 +292,11 @@ static std::string utf8_truncate(const std::string& value, size_t max_bytes)
     return value.substr(0, end) + "...";
 }
 
-static std::string local_phone_number()
+static std::string local_phone_number(uint8_t slot)
 {
-    IdfModemStatus modem = idf_modem_get_status();
+    IdfModemStatus modem = idf_modem_get_status(slot);
     if (!modem.phone.empty()) return modem.phone;
-    return idf_config_get_status_view().phoneNumber;
+    return idf_config_get_status_view().modems[slot].phoneNumber;
 }
 
 static bool parse_push_channel_token(const std::string& value, uint8_t& channel)
@@ -514,7 +517,7 @@ static bool bark_reserved_param(const std::string& key)
 
 static std::string apply_push_placeholders(const std::string& value, const std::string& sender,
                                            const std::string& text, const std::string& timestamp,
-                                           const std::string& receiver)
+                                           const std::string& receiver, uint8_t slot)
 {
     // 单次扫描替换，避免发送者/内容里出现的 {message} 等字面量被二次展开
     std::string out;
@@ -532,6 +535,7 @@ static std::string apply_push_placeholders(const std::string& value, const std::
         else if (value.compare(brace, 11, "{timestamp}") == 0) { out += timestamp; pos = brace + 11; }
         else if (value.compare(brace, 10, "{receiver}") == 0) { out += receiver; pos = brace + 10; }
         else if (value.compare(brace, 14, "{local_number}") == 0) { out += receiver; pos = brace + 14; }
+        else if (value.compare(brace, 6, "{slot}") == 0) { out += std::to_string(slot); pos = brace + 6; }
         else { out += '{'; pos = brace + 1; }
     }
     return out;
@@ -539,7 +543,8 @@ static std::string apply_push_placeholders(const std::string& value, const std::
 
 static void append_bark_params(std::string& json, const std::string& params,
                                const std::string& sender, const std::string& text,
-                               const std::string& timestamp, const std::string& receiver)
+                               const std::string& timestamp, const std::string& receiver,
+                               uint8_t slot)
 {
     std::string spec = idf_util_trim_copy(params);
     if (!spec.empty() && spec[0] == '?') spec.erase(0, 1);
@@ -562,7 +567,7 @@ static void append_bark_params(std::string& json, const std::string& params,
         }
 
         std::string value = eq == std::string::npos ? "1" : url_decode_component(item.substr(eq + 1));
-        value = apply_push_placeholders(idf_util_trim_copy(value), sender, text, timestamp, receiver);
+        value = apply_push_placeholders(idf_util_trim_copy(value), sender, text, timestamp, receiver, slot);
         json += ",";
         json += "\"";
         idf_util_json_escape_append(json, key);
@@ -606,7 +611,8 @@ static bool regex_search_case_insensitive(const std::string& pattern, const std:
     return hit;
 }
 
-static ForwardDecision eval_forward_rules(const std::string& rules, const std::string& sender, const std::string& body)
+static ForwardDecision eval_forward_rules(const std::string& rules, const std::string& sender,
+                                          const std::string& body, uint8_t slot)
 {
     ForwardDecision d;
     size_t pos = 0;
@@ -631,6 +637,7 @@ static ForwardDecision eval_forward_rules(const std::string& rules, const std::s
         if (type == "kw") hit = body.find(pat) != std::string::npos;
         else if (type == "from") hit = regex_search_case_insensitive(pat, sender);
         else if (type == "re") hit = regex_search_case_insensitive(pat, body);
+        else if (type == "slot") hit = pat == std::to_string(slot);
         if (!hit) continue;
 
         d.matched = true;
@@ -662,24 +669,24 @@ static uint32_t backoff_seconds(uint8_t attempts, uint32_t seed)
     return step + (jitter ? (seed % (jitter + 1)) : 0);
 }
 
-static bool http_transport_available()
+static bool http_transport_available(uint8_t slot)
 {
     if (idf_wifi_get_status().staConnected) return true;
-    const IdfSimSettingsView sim = idf_config_get_sim_settings_view();
-    return sim.dataEnabled && idf_modem_get_status().modemReady;
+    const IdfSimSettingsView sim = idf_config_get_sim_settings_view(slot);
+    return sim.dataEnabled && idf_modem_get_status(slot).modemReady;
 }
 
-static esp_err_t http_request(const std::string& url, const char* method,
+static esp_err_t http_request(uint8_t slot, const std::string& url, const char* method,
                               const char* content_type, const std::string& body,
                               int& status_code)
 {
     if (!idf_wifi_get_status().staConnected) {
-        const IdfSimSettingsView sim = idf_config_get_sim_settings_view();
+        const IdfSimSettingsView sim = idf_config_get_sim_settings_view(slot);
         IdfCellularHttpConfig cfg;
         cfg.dataEnabled = sim.dataEnabled;
         cfg.apn = sim.apn;
         IdfCellularHttpResult result;
-        esp_err_t err = idf_modem_cellular_http_request(url, method, content_type, body, cfg, result);
+        esp_err_t err = idf_modem_cellular_http_request(slot, url, method, content_type, body, cfg, result);
         status_code = result.httpStatus;
         return err;
     }
@@ -1209,7 +1216,7 @@ static bool send_smtp_email(const IdfEmailSettingsView& cfg, const std::string& 
     return ok;
 }
 
-static bool send_to_channel(const IdfPushChannel& channel, const char* sender_raw,
+static bool send_to_channel(uint8_t slot, const IdfPushChannel& channel, const char* sender_raw,
                             const char* text_raw, const char* timestamp_raw,
                             bool notify = false)
 {
@@ -1218,7 +1225,7 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
     std::string sender = sender_raw ? sender_raw : "";
     std::string text = text_raw ? text_raw : "";
     std::string timestamp = timestamp_raw ? timestamp_raw : "";
-    std::string receiver = notify ? std::string() : local_phone_number();
+    std::string receiver = notify ? std::string() : local_phone_number(slot);
     std::string sender_json = json_escape(sender);
     std::string text_json = json_escape(text);
     std::string ts_json = json_escape(timestamp);
@@ -1229,8 +1236,9 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
     std::string time_line_json = "\\n时间: " + ts_json;
     std::string time_block_json = "\\n\\n时间: " + ts_json;
     std::string time_html_json = "<br><b>时间:</b> " + ts_json;
+    std::string slot_line_json = notify ? std::string() : ("\\n卡槽: " + std::to_string(slot + 1));
     // 自定义提醒(notify)：sender 里放的是任务名，直接当标题用，不再套"短信来自/发送者/内容"这些短信味道的模板
-    std::string title = notify ? sender : ("短信来自: " + sender);
+    std::string title = notify ? sender : ("卡槽" + std::to_string(slot + 1) + " 短信来自: " + sender);
     std::string title_json = json_escape(title);
     std::string url;
     std::string body;
@@ -1240,7 +1248,7 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
     switch (channel.type) {
         case PUSH_TYPE_POST_JSON:
             url = channel.url;
-            body = "{\"sender\":\"" + sender_json + "\",\"receiver\":\"" + receiver_json +
+            body = "{\"slot\":" + std::to_string(slot) + ",\"sender\":\"" + sender_json + "\",\"receiver\":\"" + receiver_json +
                    "\",\"message\":\"" + text_json + "\",\"timestamp\":\"" + ts_json + "\"}";
             break;
         case PUSH_TYPE_BARK: {
@@ -1256,7 +1264,7 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
             body += ",";
             json_prop(body, "body", text + (receiver.empty() ? std::string() : ("\n\n本机号码: " + receiver)) +
                                    "\n\n时间: " + timestamp);
-            append_bark_params(body, channel.key2, sender, text, timestamp, receiver);
+            append_bark_params(body, channel.key2, sender, text, timestamp, receiver, slot);
             body += "}";
             break;
         }
@@ -1264,7 +1272,8 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
             method = "GET";
             url = channel.url + (channel.url.find('?') == std::string::npos ? "?" : "&") +
                   "sender=" + url_encode(sender) + "&receiver=" + url_encode(receiver) +
-                  "&message=" + url_encode(text) + "&timestamp=" + url_encode(timestamp);
+                  "&slot=" + std::to_string(slot) + "&message=" + url_encode(text) +
+                  "&timestamp=" + url_encode(timestamp);
             break;
         case PUSH_TYPE_DINGTALK: {
             url = channel.url;
@@ -1279,7 +1288,7 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
                 ? ("{\"msgtype\":\"text\",\"text\":{\"content\":\"" + title_json + "\\n" +
                    text_json + time_line_json + "\"}}")
                 : ("{\"msgtype\":\"text\",\"text\":{\"content\":\"短信通知\\n发送者: " +
-                   sender_json + receiver_line_json + "\\n内容: " + text_json + time_line_json + "\"}}");
+                   sender_json + slot_line_json + receiver_line_json + "\\n内容: " + text_json + time_line_json + "\"}}");
             break;
         }
         case PUSH_TYPE_PUSHPLUS: {
@@ -1320,7 +1329,8 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
         }
         case PUSH_TYPE_CUSTOM:
             url = channel.url;
-            body = apply_push_placeholders(channel.customBody, sender_json, text_json, ts_json, receiver_json);
+            body = apply_push_placeholders(channel.customBody, sender_json, text_json, ts_json,
+                                           receiver_json, slot);
             break;
         case PUSH_TYPE_FEISHU:
             url = channel.url;
@@ -1335,7 +1345,7 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
                 ? ("\"msg_type\":\"text\",\"content\":{\"text\":\"" + title_json + "\\n" +
                    text_json + time_line_json + "\"}}")
                 : ("\"msg_type\":\"text\",\"content\":{\"text\":\"短信通知\\n发送者: " +
-                   sender_json + receiver_line_json + "\\n内容: " + text_json + time_line_json + "\"}}");
+                   sender_json + slot_line_json + receiver_line_json + "\\n内容: " + text_json + time_line_json + "\"}}");
             break;
         case PUSH_TYPE_GOTIFY:
             url = channel.url;
@@ -1352,7 +1362,7 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
                 ? ("{\"chat_id\":\"" + json_escape(channel.key1) + "\",\"text\":\"" + title_json + "\\n" +
                    text_json + time_line_json + "\"}")
                 : ("{\"chat_id\":\"" + json_escape(channel.key1) + "\",\"text\":\"短信通知\\n发送者: " +
-                   sender_json + receiver_line_json + "\\n内容: " + text_json + time_line_json + "\"}");
+                   sender_json + slot_line_json + receiver_line_json + "\\n内容: " + text_json + time_line_json + "\"}");
             break;
         }
         default:
@@ -1361,7 +1371,7 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
 
     std::string name = channel.name.empty() ? ("通道" + std::to_string(channel.type)) : channel.name;
     int code = 0;
-    esp_err_t err = http_request(url, method, content_type, body, code);
+    esp_err_t err = http_request(slot, url, method, content_type, body, code);
     bool ok = (err == ESP_OK && code >= 200 && code < 300);
     // 发送中+响应码两行合并为一行结果，降噪同时保留通道名与成败
     if (err == ESP_OK) idf_logf("%s 推送%s (HTTP %d)", name.c_str(), ok ? "成功" : "失败", code);
@@ -1369,7 +1379,8 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
     return ok;
 }
 
-static bool enqueue_push_job_locked(uint8_t ch, const std::string& sender, const std::string& text,
+static bool enqueue_push_job_locked(uint8_t source_slot, uint8_t ch,
+                                    const std::string& sender, const std::string& text,
                                     const std::string& timestamp, uint8_t attempts, uint32_t delay_sec,
                                     bool notify = false, uint32_t inbox_id = 0,
                                     uint32_t completion_id = 0)
@@ -1387,6 +1398,7 @@ static bool enqueue_push_job_locked(uint8_t ch, const std::string& sender, const
     }
     PushJob& job = s_push_jobs[slot];
     job.used = true;
+    job.slot = source_slot;
     job.channel = ch;
     job.attempts = attempts;
     job.notify = notify;
@@ -1459,9 +1471,11 @@ static bool enqueue_forward_job_locked(const ForwardJob& src, uint32_t delay_sec
     return false;
 }
 
-static bool enqueue_forward_locked(const char* sender, const char* text, const char* timestamp, uint32_t inbox_id)
+static bool enqueue_forward_locked(uint8_t slot, const char* sender, const char* text,
+                                   const char* timestamp, uint32_t inbox_id)
 {
     ForwardJob job;
+    job.slot = slot;
     job.sender = sender ? sender : "";
     job.text = text ? text : "";
     job.timestamp = timestamp ? timestamp : "";
@@ -1530,7 +1544,7 @@ static bool process_forward_one()
     }
 
     const IdfPushForwardView cfg = idf_config_get_push_forward_view();
-    ForwardDecision fd = eval_forward_rules(cfg.forwardRules, job.sender, job.text);
+    ForwardDecision fd = eval_forward_rules(cfg.forwardRules, job.sender, job.text, job.slot);
     if (fd.matched && fd.drop) {
         idf_logf("转发规则命中：丢弃短信 id=%u", static_cast<unsigned>(job.inboxId));
         idf_inbox_mark_forwarded(job.inboxId);
@@ -1543,7 +1557,7 @@ static bool process_forward_one()
     if (!cfg.pushEnabled) mask = 0;
     // 本机号码只用于邮件正文；不走邮件时省掉一次模组状态查询(含互斥锁)
     const std::string receiver = (email_selected && cfg.emailEnabled && cfg.emailConfigured)
-                                     ? local_phone_number() : std::string();
+                                     ? local_phone_number(job.slot) : std::string();
     int dispatched = 0;
     bool email_queued = false;
     bool enqueue_failed = false;
@@ -1578,7 +1592,7 @@ static bool process_forward_one()
             for (uint8_t i = 0; i < IDF_MAX_PUSH_CHANNELS && !enqueue_failed; ++i) {
                 if (!(mask & (1u << i))) continue;
                 if (!channel_valid(cfg.pushChannels[i])) continue;
-                if (enqueue_push_job_locked(i, job.sender, job.text, job.timestamp, 0, 0, false,
+                if (enqueue_push_job_locked(job.slot, i, job.sender, job.text, job.timestamp, 0, 0, false,
                                             job.inboxId, completion_id)) {
                     ++dispatched;
                     had_queued_target = true;
@@ -1600,6 +1614,8 @@ static bool process_forward_one()
             subject += utf8_truncate(job.text, 48);
             std::string body = "来自：";
             body += job.sender;
+            body += "，卡槽：";
+            body += std::to_string(job.slot + 1);
             if (!receiver.empty()) {
                 body += "，本机号码：";
                 body += receiver;
@@ -1665,7 +1681,6 @@ static bool low_heap_defer()
 
 static bool process_push_one()
 {
-    if (!http_transport_available()) return false;
     if (idf_wifi_get_status().staConnected && low_heap_defer()) return false;
     int picked = -1;
     PushJob job;
@@ -1680,6 +1695,7 @@ static bool process_push_one()
     for (size_t i = 0; i < s_push_jobs.size(); ++i) {
         if (!s_push_jobs[i].used || s_push_jobs[i].nextUs > now) continue;
         if (channel_cooling(s_push_jobs[i].channel, now)) continue;  // 连续失败的通道冷却期内跳过
+        if (!http_transport_available(s_push_jobs[i].slot)) continue;
         picked = static_cast<int>(i);
         job = s_push_jobs[i];
         s_push_jobs[i] = PushJob();
@@ -1698,7 +1714,7 @@ static bool process_push_one()
         return true;
     }
 
-    bool ok = send_to_channel(channel, job.sender.c_str(), job.text.c_str(),
+    bool ok = send_to_channel(job.slot, channel, job.sender.c_str(), job.text.c_str(),
                               job.timestamp.c_str(), job.notify);
     note_channel_result(job.channel, ok);
     if (ok) {
@@ -1719,7 +1735,7 @@ static bool process_push_one()
     uint32_t delay = backoff_seconds(job.attempts, static_cast<uint32_t>(job.channel * 7 + job.attempts));
     bool requeued = false;
     if (s_mutex && xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
-        requeued = enqueue_push_job_locked(job.channel, job.sender, job.text, job.timestamp,
+        requeued = enqueue_push_job_locked(job.slot, job.channel, job.sender, job.text, job.timestamp,
                                            job.attempts, delay, job.notify, job.inboxId, job.completionId);
         xSemaphoreGive(s_mutex);
     }
@@ -1812,15 +1828,17 @@ static bool process_email_one()
 
 static bool process_test_one()
 {
-    if (!http_transport_available()) return false;
     if (idf_wifi_get_status().staConnected && low_heap_defer()) return false;
     int picked = -1;
+    uint8_t slot = 0;
     IdfPushChannel channel;
     const IdfPushNotifyView cfg = idf_config_get_push_notify_view();
     if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
     for (uint8_t i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
         if (!s_test_jobs[i].pending) continue;
+        if (!http_transport_available(s_test_jobs[i].slot)) continue;
         picked = i;
+        slot = s_test_jobs[i].slot;
         s_test_jobs[i].pending = false;
         s_test_jobs[i].running = true;
         s_test_jobs[i].done = false;
@@ -1839,7 +1857,7 @@ static bool process_test_one()
     } else {
         s_busy.store(true, std::memory_order_relaxed);
         std::string ts = format_local_time(cfg.tzOffsetMin);
-        ok = send_to_channel(channel, "测试", "这是一条来自 SMS Forwarder 的测试推送",
+        ok = send_to_channel(slot, channel, "测试", "这是一条来自 SMS Forwarder 的测试推送",
                              ts.empty() ? "时间未同步" : ts.c_str());
         s_busy.store(false, std::memory_order_relaxed);
         result = ok ? "测试推送已发送" : "测试推送失败，请查看日志";
@@ -1891,20 +1909,26 @@ esp_err_t idf_push_start(void)
     return ESP_OK;
 }
 
-bool idf_push_enqueue_forward(const char* sender, const char* text, const char* timestamp, uint32_t inbox_id)
+bool idf_push_enqueue_forward(uint8_t slot, const char* sender, const char* text,
+                              const char* timestamp, uint32_t inbox_id)
 {
+    if (!idf_modem_slot_valid(slot)) {
+        idf_logf("转发入队拒绝非法 slot=%u", static_cast<unsigned>(slot));
+        return false;
+    }
     if (!ensure_init()) return false;
     // 临界区都很短(纯内存操作)，无限等锁保证收到的短信绝不因锁竞争被丢
     if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return false;
-    bool ok = enqueue_forward_locked(sender, text, timestamp, inbox_id);
+    bool ok = enqueue_forward_locked(slot, sender, text, timestamp, inbox_id);
     xSemaphoreGive(s_mutex);
     if (ok) wake_worker();
     else idf_log_line("转发队列已满，短信暂未转发");
     return ok;
 }
 
-int idf_push_enqueue_notify(const char* title, const char* body, const char* timestamp)
+int idf_push_enqueue_notify(uint8_t slot, const char* title, const char* body, const char* timestamp)
 {
+    if (!idf_modem_slot_valid(slot)) return 0;
     if (!ensure_init()) return 0;
     const IdfPushNotifyView cfg = idf_config_get_push_notify_view();
     if (!cfg.pushEnabled) return 0;
@@ -1917,7 +1941,7 @@ int idf_push_enqueue_notify(const char* title, const char* body, const char* tim
     if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return 0;
     for (uint8_t i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
         if (!channel_valid(cfg.pushChannels[i])) continue;
-        if (enqueue_push_job_locked(i, title ? title : "系统通知", body ? body : "", ts, 0, 0, true)) {
+        if (enqueue_push_job_locked(slot, i, title ? title : "系统通知", body ? body : "", ts, 0, 0, true)) {
             ++dispatched;
         }
     }
@@ -1977,13 +2001,17 @@ bool idf_push_busy(void)
     return s_busy.load(std::memory_order_relaxed);
 }
 
-bool idf_push_enqueue_test(uint8_t channel, std::string& message)
+bool idf_push_enqueue_test(uint8_t slot, uint8_t channel, std::string& message)
 {
+    if (!idf_modem_slot_valid(slot)) {
+        message = "卡槽序号无效";
+        return false;
+    }
     if (channel >= IDF_MAX_PUSH_CHANNELS) {
         message = "通道序号无效";
         return false;
     }
-    if (!http_transport_available()) {
+    if (!http_transport_available(slot)) {
         message = "WiFi 未连接且蜂窝数据不可用，暂不能测试推送";
         return false;
     }
@@ -2000,6 +2028,7 @@ bool idf_push_enqueue_test(uint8_t channel, std::string& message)
     TestJob& job = s_test_jobs[channel];
     bool busy = job.pending || job.running;
     if (valid && !busy) {
+        job.slot = slot;
         job.pending = true;
         job.running = false;
         job.done = false;
@@ -2039,6 +2068,7 @@ std::string idf_push_test_status_json(uint8_t channel)
     out += "\"running\":"; out += copy.running ? "true" : "false"; out += ",";
     out += "\"done\":"; out += copy.done ? "true" : "false"; out += ",";
     out += "\"success\":"; out += copy.success ? "true" : "false"; out += ",";
+    out += "\"slot\":"; out += std::to_string(copy.slot); out += ",";
     json_prop(out, "message", msg);
     out += "}";
     return out;

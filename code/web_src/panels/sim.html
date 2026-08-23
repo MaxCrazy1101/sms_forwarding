@@ -5,17 +5,18 @@
         <div class="sim-stack">
         <form action="/save" method="POST" id="simFormEl">
         <input type="hidden" name="simForm" value="1">
+        <div class="form-group"><label class="form-label">蜂窝 / SIM 配置卡槽</label><select class="form-select" name="slot" id="simSlot" onchange="simSlotChange()"><option value="0">卡槽 1</option><option value="1">卡槽 2</option></select></div>
         <div class="card">
           <div class="card-header">蜂窝数据设置</div>
           <div class="card-body">
-            <div class="form-group"><label class="switch-row"><span class="switch-text">允许蜂窝数据（流量）</span><input type="checkbox" class="switch-input" name="dataEnabled" %DATA_CHECKED%><span class="switch-slider"></span></label>
+            <div class="form-group"><label class="switch-row"><span class="switch-text">允许蜂窝数据（流量）</span><input type="checkbox" class="switch-input" name="dataEnabled" id="simDataEnabled" %DATA_CHECKED%><span class="switch-slider"></span></label>
               <p class="form-hint" style="color:var(--error);font-weight:600">注意：开启会产生蜂窝流量；部分漫游 SIM、模组与运营商组合在激活数据 PDP 后可能影响短信承载。本机经 WiFi 转发时通常无需开启，建议保持关闭。</p>
               <p class="form-hint">默认关闭=禁用 PDP，零流量。仅在需要保号 HTTP payload / 蜂窝 IP 时临时开启。</p></div>
-            <div class="form-group"><label class="switch-row"><span class="switch-text">允许数据漫游</span><input type="checkbox" class="switch-input" name="roamingEnabled" %ROAMING_CHECKED%><span class="switch-slider"></span></label>
+            <div class="form-group"><label class="switch-row"><span class="switch-text">允许数据漫游</span><input type="checkbox" class="switch-input" name="roamingEnabled" id="simRoamingEnabled" %ROAMING_CHECKED%><span class="switch-slider"></span></label>
               <p class="form-hint">同手机“数据漫游”：关闭后设备处于漫游网络(CEREG=5)时不激活蜂窝数据、不跑漫游流量。该开关仅控制数据 PDP，不直接判断短信可用性；漫游短信是否可用由 SIM、模组与运营商网络共同决定。</p></div>
-            <div class="form-group"><label class="form-label">APN</label><input class="form-input" type="text" name="apn" value="%APN%" placeholder="留空=运营商自动（如 cmnet）"></div>
+            <div class="form-group"><label class="form-label">APN</label><input class="form-input" type="text" name="apn" id="simApn" value="%APN%" placeholder="留空=运营商自动（如 cmnet）"></div>
             <div class="form-group"><label class="form-label">运营商</label>
-              <input class="form-input" type="text" name="operatorPlmn" value="%OPERATOR_PLMN%" placeholder="留空 = 自动注册（推荐）" list="plmnList">
+              <input class="form-input" type="text" name="operatorPlmn" id="simOperatorPlmn" value="%OPERATOR_PLMN%" placeholder="留空 = 自动注册（推荐）" list="plmnList">
               <datalist id="plmnList">
                 <option value="46000">中国移动</option>
                 <option value="46001">中国联通</option>
@@ -26,7 +27,7 @@
               </datalist>
               <p class="form-hint">从列表选运营商或手动填 PLMN(MCC+MNC，国外同理)。仅能选 SIM 可接入的网络，锁定不可达会失网；不确定留空自动。</p></div>
             <div class="form-group"><label class="form-label">本机号码（手填）</label>
-              <input class="form-input" type="text" name="phoneNumber" value="%PHONE_NUMBER%" placeholder="卡不上报号码时用于概览显示，可留空">
+              <input class="form-input" type="text" name="phoneNumber" id="simPhoneNumber" value="%PHONE_NUMBER%" placeholder="卡不上报号码时用于概览显示，可留空">
               <p class="form-hint">多数 eSIM/数据卡不通过 CNUM 上报本机号码，模组读不到时概览会显示这里的手填值。换卡后请更新或清空，否则会一直显示旧号码。</p></div>
           </div>
         </div>

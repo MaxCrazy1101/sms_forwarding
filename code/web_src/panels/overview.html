@@ -1,18 +1,8 @@
 <div class="panel active" id="panel-overview">
       <h1 class="page-title">系统概览</h1>
       <p class="page-subtitle">设备信号、转发与系统状态遥测</p>
-      <!-- 信号量表(签名) -->
-      <div class="card sig-card" style="margin-bottom:14px">
-          <div class="card-header">信号 SIGNAL<span id="ovRefresh" style="margin-left:auto;color:var(--faint);font-size:10.5px;font-family:var(--mono);font-weight:400;">设备 --</span><button type="button" class="btn btn-secondary btn-sm" style="margin-left:10px;" onclick="refreshModemInfo(this)">刷新模组信息</button></div>
-        <div class="card-body">
-          <div class="gauge"><span class="gl">CSQ</span><span class="track"><i class="tk" style="left:26%"></i><i class="tk" style="left:45%"></i><span class="fill" id="gCsq"></span></span><span class="gv" id="gCsqV">--</span></div>
-          <div class="gauge"><span class="gl">RSSI</span><span class="track"><i class="tk" style="left:25%"></i><i class="tk" style="left:58%"></i><span class="fill" id="gRssi"></span></span><span class="gv" id="gRssiV">--</span></div>
-          <div class="gauge"><span class="gl">RSRP</span><span class="track"><i class="tk" style="left:20%"></i><i class="tk" style="left:50%"></i><span class="fill" id="gRsrp"></span></span><span class="gv" id="gRsrpV">--</span></div>
-          <div class="gauge"><span class="gl">RSRQ</span><span class="track"><i class="tk" style="left:29%"></i><i class="tk" style="left:59%"></i><span class="fill" id="gRsrq"></span></span><span class="gv" id="gRsrqV">--</span></div>
-          <div class="gauge"><span class="gl">SINR</span><span class="track"><i class="tk" style="left:33%"></i><i class="tk" style="left:60%"></i><span class="fill" id="gSinr"></span></span><span class="gv" id="gSinrV">--</span></div>
-          <div class="gauge"><span class="gl">WiFi</span><span class="track"><i class="tk" style="left:30%"></i><i class="tk" style="left:50%"></i><span class="fill" id="gWifi"></span></span><span class="gv" id="gWifiV">--</span></div>
-        </div>
-      </div>
+      <div id="ovRefresh" style="margin-bottom:8px;color:var(--faint);font-size:10.5px;font-family:var(--mono);">设备 --</div>
+      <div class="card-grid" id="modemOverviewCards" style="margin-bottom:14px;"></div>
       <!-- KPI 指标条 -->
       <div class="stat-row">
         <div class="stat"><div class="k">蜂窝数据</div><div class="v" id="ovData">--</div><div class="s" id="ovDataSub">--</div></div>
@@ -48,30 +38,12 @@
             </table>
           </div>
         </div>
-        <div class="card">
-          <div class="card-header">SIM 卡信息</div>
-          <div class="card-body">
-            <table class="info-table">
-              <tr><td>运营商</td><td id="tOp">--</td></tr>
-              <tr><td>模组状态</td><td id="tModem">%MODEM_CHECK%</td></tr>
-              <tr><td>上网 IP（蜂窝）</td><td id="tCellIp">--</td></tr>
-              <tr><td>本机号码</td><td id="tPhone">--</td></tr>
-              <tr><td>IMEI</td><td id="tImei">--</td></tr>
-              <tr><td>ICCID</td><td id="tIccid">--</td></tr>
-              <tr><td>IMSI</td><td id="tImsi">--</td></tr>
-              <tr><td>APN</td><td id="tApn">--</td></tr>
-            </table>
-          </div>
-        </div>
       </div>
       <div>
         <div class="card">
           <div class="card-header">设备 / 固件信息</div>
           <div class="card-body">
             <table class="info-table">
-              <tr><td>制造商</td><td id="dvMfr">--</td></tr>
-              <tr><td>模组型号</td><td id="dvModel">--</td></tr>
-              <tr><td>模组固件</td><td id="dvFw">--</td></tr>
               <tr><td>主控固件</td><td id="dvEspVer">--</td></tr>
               <tr><td>空闲堆</td><td id="dvHeap">--</td></tr>
               <tr><td>最大可分配块</td><td id="tMaxBlock">--</td></tr>

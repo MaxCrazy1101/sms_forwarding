@@ -27,6 +27,7 @@
       <div class="card">
         <div class="card-header">推送通道</div>
         <div class="card-body">
+          <div class="form-group"><label class="form-label">测试推送蜂窝出口</label><select class="form-select" id="pushTestSlot"><option value="0">卡槽 1</option><option value="1">卡槽 2</option></select></div>
           <label class="switch-row" style="margin-bottom:12px;"><span class="switch-text">启用推送转发</span><input type="checkbox" class="switch-input" name="pushEnabled" %PUSH_EN%><span class="switch-slider"></span></label>
           %PUSH_CHANNELS%
           <button type="button" class="btn btn-secondary btn-block" id="addChannelBtn" onclick="addChannel()" style="margin-top:8px;">+ 添加推送通道</button>
@@ -55,7 +56,8 @@
       <div class="card">
         <div class="card-header">来电通知</div>
         <div class="card-body">
-          <label class="switch-row"><span class="switch-text">启用来电通知</span><input type="checkbox" class="switch-input" name="callNotifyEnabled" %CALLNOTIFY_CHECKED%><span class="switch-slider"></span></label>
+          <div class="form-group"><label class="form-label">目标卡槽</label><select class="form-select" name="slot" id="callNotifySlot" onchange="callNotifySlotChange()"><option value="0">卡槽 1</option><option value="1">卡槽 2</option></select></div>
+          <label class="switch-row"><span class="switch-text">启用来电通知</span><input type="checkbox" class="switch-input" name="callNotifyEnabled" id="callNotifyEnabled" %CALLNOTIFY_CHECKED%><span class="switch-slider"></span></label>
           <p class="form-hint">有来电时把主叫号码通过与短信相同的通道（已启用的推送 + 邮件）推送；号码被运营商隐藏时显示为未知号码。设备只通知、不接听也不回拨。黑名单号码来电不通知。</p>
           <button type="submit" class="btn btn-primary btn-block btn-save" style="margin-top:4px;">保存来电通知</button>
         </div>
@@ -80,11 +82,12 @@
         <div class="card">
           <div class="card-header">转发规则<button type="button" class="btn btn-secondary btn-sm" style="margin-left:auto;" onclick="addRule()">+ 添加规则</button></div>
           <div class="card-body">
-            <p class="form-hint" style="margin-bottom:10px;">按发件人 / 关键词 / 正则把短信分流到指定通道或丢弃，自上而下匹配、命中即止；无规则命中则转发到全部启用通道。</p>
+            <p class="form-hint" style="margin-bottom:10px;">按卡槽 / 发件人 / 关键词 / 正则把短信分流到指定通道或丢弃，自上而下匹配、命中即止；无规则命中则转发到全部启用通道。</p>
             <div id="rulesList"></div>
             <div class="rule-tester">
               <div class="form-label" style="margin-bottom:6px;">规则测试（本地预览，不发送）</div>
               <div class="at-bar" style="margin-bottom:6px;">
+                <select class="form-select" id="rtSlot" style="flex:0 0 100px;"><option value="0">卡槽 1</option><option value="1">卡槽 2</option></select>
                 <input class="form-input" type="text" id="rtFrom" placeholder="发件人，如 10086" style="flex:0 0 150px;">
                 <input class="form-input" type="text" id="rtText" placeholder="粘贴一条短信正文，看看会命中哪条规则">
                 <button type="button" class="btn btn-secondary btn-sm" onclick="testRules()">测试匹配</button>

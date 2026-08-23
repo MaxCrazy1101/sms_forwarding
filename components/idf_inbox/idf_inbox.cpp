@@ -28,7 +28,7 @@ static constexpr size_t BODY_MAX = 320;
 static constexpr const char* SMS_NVS_PART = "smsdata";
 static constexpr const char* NS_INBOX = "inbox";
 static constexpr const char* NS_SENT = "sent";
-static constexpr uint8_t BLOB_VERSION = 1;
+static constexpr uint8_t BLOB_VERSION = 2;
 
 struct InboxSlot : IdfInboxEntry {
     bool deleted = false;
@@ -86,9 +86,10 @@ static void persist_inbox_entry(const InboxSlot& e)
 {
     if (!s_nvs_ready) return;
     std::string blob;
-    blob.reserve(16 + e.sender.size() + e.ts.size() + e.text.size());
+    blob.reserve(17 + e.sender.size() + e.ts.size() + e.text.size());
     blob_put_u8(blob, BLOB_VERSION);
     blob_put_u8(blob, e.forwarded ? 1 : 0);
+    blob_put_u8(blob, e.slot);
     blob_put_u32(blob, e.id);
     blob_put_u32(blob, e.recvEpoch);
     blob_put_str(blob, e.sender, false);
@@ -113,9 +114,10 @@ static void persist_sent_entry(const IdfSentEntry& e)
 {
     if (!s_nvs_ready) return;
     std::string blob;
-    blob.reserve(12 + e.target.size() + e.text.size());
+    blob.reserve(13 + e.target.size() + e.text.size());
     blob_put_u8(blob, BLOB_VERSION);
     blob_put_u8(blob, e.ok ? 1 : 0);
+    blob_put_u8(blob, e.slot);
     blob_put_u32(blob, e.id);
     blob_put_u32(blob, e.sentEpoch);
     blob_put_str(blob, e.target, false);
@@ -173,13 +175,14 @@ static void load_inbox_from_flash()
         uint8_t ver = r.u8();
         bool forwarded = r.u8() != 0;
         IdfInboxEntry e;
+        e.slot = r.u8();
         e.id = r.u32();
         e.recvEpoch = r.u32();
         e.sender = r.str(false);
         e.ts = r.str(false);
         e.text = r.str(true);
         e.forwarded = forwarded;
-        if (ver != BLOB_VERSION || !r.ok || e.id == 0) return false;
+        if (ver != BLOB_VERSION || !r.ok || e.slot > 1 || e.id == 0) return false;
         items.push_back(std::move(e));
         return true;
     });
@@ -208,12 +211,13 @@ static void load_sent_from_flash()
         uint8_t ver = r.u8();
         bool ok = r.u8() != 0;
         IdfSentEntry e;
+        e.slot = r.u8();
         e.id = r.u32();
         e.sentEpoch = r.u32();
         e.target = r.str(false);
         e.text = r.str(true);
         e.ok = ok;
-        if (ver != BLOB_VERSION || !r.ok || e.id == 0) return false;
+        if (ver != BLOB_VERSION || !r.ok || e.slot > 1 || e.id == 0) return false;
         items.push_back(std::move(e));
         return true;
     });
@@ -303,7 +307,7 @@ void idf_inbox_init(void)
     }
 }
 
-uint32_t idf_inbox_add(const char* sender, const char* text, const char* ts)
+uint32_t idf_inbox_add(uint8_t slot, const char* sender, const char* text, const char* ts)
 {
     ensure_init();
     // 收到短信后入库不能因为网页正在读/flash 正在提交而放弃；SMS 任务本来就是串行处理。
@@ -312,6 +316,7 @@ uint32_t idf_inbox_add(const char* sender, const char* text, const char* ts)
     InboxSlot& e = s_inbox[s_inbox_head];
     // 环满时该物理槽即将覆盖最旧短信：先把它的 flash key 擦掉，保持 NVS 只存活动条目
     uint32_t evict_id = (s_inbox_filled == INBOX_MAX && !e.deleted) ? e.id : 0;
+    e.slot = slot;
     e.id = ++s_inbox_seq;
     e.recvEpoch = static_cast<uint32_t>(time(nullptr));
     e.sender = sender ? sender : "";
@@ -373,12 +378,7 @@ bool idf_inbox_get_by_id(uint32_t id, IdfInboxEntry& out)
     bool ok = false;
     for (size_t i = 0; i < s_inbox_filled; ++i) {
         if (s_inbox[i].id == id && !s_inbox[i].deleted) {
-            out.id = s_inbox[i].id;
-            out.recvEpoch = s_inbox[i].recvEpoch;
-            out.sender = s_inbox[i].sender;
-            out.ts = s_inbox[i].ts;
-            out.text = s_inbox[i].text;
-            out.forwarded = s_inbox[i].forwarded;
+            out = static_cast<const IdfInboxEntry&>(s_inbox[i]);
             ok = true;
             break;
         }
@@ -408,13 +408,14 @@ bool idf_inbox_delete(uint32_t id)
     return ok;
 }
 
-void idf_sent_add(const char* target, const char* text, bool ok)
+void idf_sent_add(uint8_t slot, const char* target, const char* text, bool ok)
 {
     ensure_init();
     if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return;
 
     IdfSentEntry& e = s_sent[s_sent_head];
     uint32_t evict_id = (s_sent_filled == SENT_MAX && e.id != 0) ? e.id : 0;
+    e.slot = slot;
     e.id = ++s_sent_seq;
     e.sentEpoch = static_cast<uint32_t>(time(nullptr));
     e.target = target ? target : "";
@@ -451,8 +452,9 @@ std::string idf_inbox_json(bool sent_box, int limit)
             size_t idx = (s_sent_head + SENT_MAX - 1 - k) % SENT_MAX;
             const IdfSentEntry& e = s_sent[idx];
             if (emitted) out += ",";
-            snprintf(buf, sizeof(buf), "{\"id\":%u,\"sent\":%u,",
-                     static_cast<unsigned>(e.id), static_cast<unsigned>(e.sentEpoch));
+            snprintf(buf, sizeof(buf), "{\"id\":%u,\"sent\":%u,\"slot\":%u,",
+                     static_cast<unsigned>(e.id), static_cast<unsigned>(e.sentEpoch),
+                     static_cast<unsigned>(e.slot));
             out += buf;
             json_prop(out, "target", e.target); out += ",";
             json_prop(out, "text", e.text); out += ",";
@@ -469,8 +471,9 @@ std::string idf_inbox_json(bool sent_box, int limit)
             const InboxSlot& e = s_inbox[idx];
             if (e.deleted) continue;
             if (emitted) out += ",";
-            snprintf(buf, sizeof(buf), "{\"id\":%u,\"recv\":%u,",
-                     static_cast<unsigned>(e.id), static_cast<unsigned>(e.recvEpoch));
+            snprintf(buf, sizeof(buf), "{\"id\":%u,\"recv\":%u,\"slot\":%u,",
+                     static_cast<unsigned>(e.id), static_cast<unsigned>(e.recvEpoch),
+                     static_cast<unsigned>(e.slot));
             out += buf;
             json_prop(out, "sender", e.sender); out += ",";
             json_prop(out, "ts", e.ts); out += ",";

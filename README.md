@@ -8,6 +8,8 @@
 
 ESP32-C3 + ML307 系列 4G/LTE 模组的轻量短信转发固件。设备通过 UART/AT 接收 PDU 短信，在本地完成中文短信、长短信、去重和规则判断，然后经 WiFi 转发到邮件与最多 5 个推送通道；同时支持来电通知与 SIM 卡热插拔检测，并提供 Web UI 完成配置、诊断、日志、OTA、保号和定时任务。
 
+`dual-modem-sms-receive` 分支正在实现两个对等 ML307R 卡槽。当前阶段只完成控制台迁移和硬件接口冻结，卡槽2尚未由固件启动，不能作为双卡可用版本部署。
+
 本仓库现在只保留 **原生 ESP-IDF** 固件；Arduino fallback 已移除。项目目标不是做一个“能跑的 demo”，而是做一套适合长期插电、无人值守、可 OTA、可排障、资源占用可控的短信网关固件。
 
 ## 功能一览
@@ -196,7 +198,7 @@ Web 侧数据流：
 | `smsdata` | 640KB | 短信、收件箱等本地数据，使用 NVS 磨损均衡与掉电原子写入 |
 | `coredump` | 64KB | 崩溃转储，便于定位无人值守设备的异常 |
 
-`app0`/`app1` 保留双 OTA 槽位，每个槽位 1.625MiB。ESP-IDF 6.0.2 构建的当前固件约 1.22MiB，单槽剩余约 25%（约 417KiB），可继续容纳后续 eSIM、诊断和 UI 功能。`smsdata` 单独放大，避免短信留存和普通配置共用很小的 NVS 空间。
+`app0`/`app1` 保留双 OTA 槽位，每个槽位 1.625MiB。ESP-IDF 6.0.2 在控制台迁移后的固件约 1.26MiB，单槽剩余约 22%（约 373KiB），可继续容纳双模组、诊断和 UI 功能，但每个阶段都必须继续记录镜像余量。`smsdata` 单独放大，避免短信留存和普通配置共用很小的 NVS 空间。
 
 ## 体积与内存优化
 
@@ -300,7 +302,7 @@ esptool --chip esp32c3 -p COM5 -b 460800 --before default-reset --after hard-res
 - USB 数据线和对应串口驱动。
 - ESP-IDF 6.0.2。仓库脚本默认查找 `E:\Espressif\esp-idf-v6.0.2`，也可以通过 `IDF_PATH` 和 `IDF_TOOLS_PATH` 环境变量指定自己的安装位置。
 
-确认串口号：
+固件控制台使用 ESP32-C3 芯片内置 USB Serial/JTAG（GPIO18/19），不再使用 UART0 TTL 控制台。确认 Windows 串口号：
 
 ```powershell
 Get-CimInstance Win32_SerialPort | Select-Object DeviceID,Description
@@ -319,6 +321,10 @@ cd sms_forwarding
 powershell -ExecutionPolicy Bypass -File tools\idf.ps1 build
 ```
 
+如果复用旧的 `build/sdkconfig.idf6`，配置阶段会明确拒绝 UART0 控制台。请在 `menuconfig` 的
+`Component config → ESP-STDIO` 中把主控制台改为 `USB Serial/JTAG Controller`、副控制台改为
+`No secondary console`；全新构建目录会直接使用仓库的 `sdkconfig.defaults`。
+
 如果只改了 Web UI 源码，构建前先重新生成静态资源：
 
 ```powershell
@@ -332,6 +338,9 @@ python tools\build_web_assets.py --check
 powershell -ExecutionPolicy Bypass -File tools\idf.ps1 flash -Port COM5
 ```
 
+控制台迁移同时改变 bootloader 配置，首次安装本分支必须执行上述完整 `flash`。网页 OTA 只更新
+app 分区，不能替换旧 bootloader；只刷 OTA 的设备在复位阶段仍可能从旧 UART0 控制台输出。
+
 打开串口日志：
 
 ```powershell
@@ -339,6 +348,17 @@ powershell -ExecutionPolicy Bypass -File tools\idf.ps1 monitor -Port COM5
 ```
 
 `monitor` 中可以看到 WiFi 连接、模组初始化、短信接收、推送、Web 访问和崩溃原因等日志。退出 monitor 通常使用 `Ctrl+]`。
+
+Linux 使用固定 ESP-IDF 6.0.2 环境，通过同一个 USB Serial/JTAG 设备烧录和监控；设备名通常是 `/dev/ttyACM0`，以实际枚举结果为准：
+
+```bash
+. /home/alex/code/sdk/esp-idf/6.0/export.sh
+python tools/apply_idf_patches.py --idf-path /home/alex/code/sdk/esp-idf/6.0
+idf.py -B build/idf6 -D SDKCONFIG=build/sdkconfig.idf6 -p /dev/ttyACM0 flash
+idf.py -B build/idf6 -D SDKCONFIG=build/sdkconfig.idf6 -p /dev/ttyACM0 monitor
+```
+
+烧录、运行日志和 panic 输出均应从该 USB CDC/ACM 端口读取。GPIO20/21 即使不作为应用控制台，复位早期仍可能出现 ROM UART0 输出，因此不得连接到第二个 ML307R。
 
 CI 使用固定的 ESP-IDF 6.0.2 环境，通过 `.github/workflows/build.yml` 构建固件；日常本地开发建议仍使用 `tools\idf.ps1`，这样 SDK 版本、构建目录和配置文件位置保持一致。
 
@@ -363,17 +383,24 @@ CI 使用固定的 ESP-IDF 6.0.2 环境，通过 `.github/workflows/build.yml` �
 
 ## 硬件接线
 
-ESP32-C3 Super Mini 与 ML307x-DC UART 连接：
+双模组开发分支的接口固定如下；ESP 侧 TX 连接 ML307 RX，ESP 侧 RX 连接 ML307 TX：
 
 ```text
-ESP32-C3 GPIO5  -> ML307 EN
-ESP32-C3 GPIO3  -> ML307 RX
-ESP32-C3 GPIO4  -> ML307 TX
-ESP32-C3 GND    -> ML307 GND
-ESP32-C3 5V     -> ML307 VCC
+卡槽1：GPIO5  -> ML307 #1 EN
+       GPIO3  -> ML307 #1 RX
+       GPIO4  <- ML307 #1 TX
+
+卡槽2：GPIO10 -> ML307 #2 EN
+       GPIO6  -> ML307 #2 RX
+       GPIO7  <- ML307 #2 TX
+
+控制台：GPIO18/19 -> ESP32-C3 内置 USB Serial/JTAG
+禁接模组：GPIO20/21
 ```
 
-默认引脚定义在 ESP-IDF 模组组件中：TXD=GPIO3，RXD=GPIO4，MODEM_EN=GPIO5，LED=GPIO8。
+两个模组必须共地，并使用能够承受两路同时注册/发射峰值的外部电源。默认工程目标为 5V/4A、星形分支和每块模组就近储能；不要从 ESP32-C3 Super Mini 的板载 USB/5V 细走线串供两块模组。接线前还必须核对所用 ML307 核心板的 5V 输入、板载 DC/DC、EN 有效电平和外围偏置。
+
+当前 Phase 1 产品代码仍只启动卡槽1（UART1/GPIO3/4/5）；GPIO6/7/10 是后续双实例阶段的预留接线，不表示卡槽2已经可用。GPIO4~7 不启用外部 Pad JTAG，调试继续使用 GPIO18/19 的内置 USB Serial/JTAG。
 
 ## 开发入口
 

@@ -13,6 +13,7 @@ struct IdfModemStatus {
     bool modemReady = false;
     bool signalFresh = false;
     bool identityFresh = false;
+    uint32_t stackFreeBytes = 0;
     std::string phase = "off";
     int ceregStat = -1;
     int csq = -1;
@@ -50,47 +51,59 @@ struct IdfCellularHttpConfig {
     std::string apn;
 };
 
-esp_err_t idf_modem_start(const IdfConfig& config);
-esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response);
-esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uint32_t timeout_ms, std::string& response);
-esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response);
-esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularHttpConfig& config, IdfCellularHttpResult& result);
-esp_err_t idf_modem_cellular_http_request(const std::string& url, const char* method,
+static constexpr uint8_t IDF_MODEM_SLOT_COUNT = 2;
+
+constexpr bool idf_modem_slot_valid(uint8_t slot)
+{
+    return slot < IDF_MODEM_SLOT_COUNT;
+}
+
+esp_err_t idf_modem_start(uint8_t slot, const IdfConfig& config);
+esp_err_t idf_modem_send_at(uint8_t slot, const std::string& cmd, uint32_t timeout_ms,
+                            std::string& response);
+esp_err_t idf_modem_send_at_until(uint8_t slot, const std::string& cmd, const char* token,
+                                  uint32_t timeout_ms, std::string& response);
+esp_err_t idf_modem_send_pdu(uint8_t slot, const std::string& cmgs_cmd, const char* pdu,
+                             uint32_t timeout_ms, std::string& response);
+esp_err_t idf_modem_cellular_http_get(uint8_t slot, const std::string& url,
+                                      const IdfCellularHttpConfig& config,
+                                      IdfCellularHttpResult& result);
+esp_err_t idf_modem_cellular_http_request(uint8_t slot, const std::string& url, const char* method,
                                            const char* content_type, const std::string& body,
                                            const IdfCellularHttpConfig& config,
                                            IdfCellularHttpResult& result);
-esp_err_t idf_modem_request_reset(bool hard_reset);
+esp_err_t idf_modem_request_reset(uint8_t slot, bool hard_reset);
 // 请求模组任务重新检查 SIM 锁；allow_puk=true 仅用于网页二次确认后的单次 PUK 操作。
-esp_err_t idf_modem_request_sim_unlock(bool allow_puk);
-bool idf_modem_take_urc(std::string& out);
+esp_err_t idf_modem_request_sim_unlock(uint8_t slot, bool allow_puk);
+bool idf_modem_take_urc(uint8_t slot, std::string& out);
 // 等待模组事件(新 URC 入缓冲/外部唤醒)，超时返回 false；用于替代固定轮询延时
-bool idf_modem_wait_event(uint32_t timeout_ms);
+bool idf_modem_wait_event(uint8_t slot, uint32_t timeout_ms);
 // 唤醒等待者(短信任务)：URC 入缓冲、网页短信入队等场景调用
-void idf_modem_signal_event(void);
-IdfModemStatus idf_modem_get_status(void);
+void idf_modem_signal_event(uint8_t slot);
+IdfModemStatus idf_modem_get_status(uint8_t slot);
 // 获取合法数字 IMEI；优先使用缓存，缓存缺失时通过模组标准 IMEI 命令补采。
-esp_err_t idf_modem_get_imei(std::string& imei);
+esp_err_t idf_modem_get_imei(uint8_t slot, std::string& imei);
 // AT 通道当前是否空闲（Web 路由用于"模组正忙"快速返回，避免长时间阻塞 httpd 任务）
-bool idf_modem_at_idle(void);
+bool idf_modem_at_idle(uint8_t slot);
 // 用户显式请求刷新概览模组信息时，短时间打开展示型身份/信号采样窗口。
-void idf_modem_request_status_sample(void);
+void idf_modem_request_status_sample(uint8_t slot);
 // 重申短信存储选择(CPMS MT→ME→SM)：短信任务随 CMGF/CNMI 周期重申一起调用，
 // 覆盖"模组自发复位后存储回落默认值、短信无处可存"的静默失效
-void idf_modem_reassert_sms_storage(void);
+void idf_modem_reassert_sms_storage(uint8_t slot);
 // 每日后台短信体检：检查注册、PDU、CNMI 与短信存储，配置异常时自动重申。
 // 只能验证本机短信栈，无法证明运营商已实际投递一条新短信。
-bool idf_modem_sms_health_check(std::string& summary);
+bool idf_modem_sms_health_check(uint8_t slot, std::string& summary);
 // eSIM APDU 会话期间暂停模组/SMS 后台 AT，避免 CPMS/CMGL/健康探测插入逻辑通道操作。
-void idf_modem_begin_esim_operation(void);
-void idf_modem_end_esim_operation(void);
-bool idf_modem_esim_operation_active(void);
+void idf_modem_begin_esim_operation(uint8_t slot);
+void idf_modem_end_esim_operation(uint8_t slot);
+bool idf_modem_esim_operation_active(uint8_t slot);
 // 启用/切换/禁用 eSIM Profile 后调用：清除缓存的卡相关身份(号码/ICCID/IMSI/运营商/APN)
 // 并请求一次采样，使概览重读新生效 Profile 的信息，而不是沿用旧卡缓存值。
-void idf_modem_invalidate_sim_identity(void);
+void idf_modem_invalidate_sim_identity(uint8_t slot);
 // 注册"卡身份已变化"通知钩子(热插拔/eSIM 切换均触发)，供上层失效自身缓存(如 eSIM EID)。
 // 钩子可能在模组任务上下文被调用，实现必须无阻塞。
-void idf_modem_set_sim_identity_hook(void (*hook)(void));
+void idf_modem_set_sim_identity_hook(void (*hook)(uint8_t slot));
 // 计划内 ESP 重启(网页重启/每日定时重启/低堆重启)前调用：拉低 EN 让模组彻底断电，
 // 重启后走全新上电。保留"重启设备可救活 AT 正常但收信已死的模组"的原有语义；
 // 热启动快路径只服务于崩溃/看门狗等意外复位
-void idf_modem_power_off_for_restart(void);
+void idf_modem_power_off_all_for_restart(void);

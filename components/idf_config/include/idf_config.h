@@ -36,8 +36,19 @@ struct IdfWifiNetwork {
     std::string pass;
 };
 
+struct IdfModemSlotConfig {
+    bool dataEnabled = false;
+    bool roamingEnabled = true;
+    std::string apn;
+    std::string operatorPlmn;
+    std::string phoneNumber;
+    bool netLedEnabled = true;
+    bool callNotifyEnabled = true;
+};
+
 // 进阶定时任务：可选定目标 eSIM Profile，每 N 天执行一个动作，完成后可切回原卡
 struct IdfSchedTask {
+    uint8_t slot = 0;
     bool enabled = false;
     std::string name;        // 显示名
     std::string profile;     // 目标 eSIM Profile(ICCID/别名)；空 = 不切卡，用当前卡
@@ -81,6 +92,7 @@ struct IdfConfig {
     std::string forwardRules;
 
     bool kaEnabled = false;
+    uint8_t kaSlot = 0;
     int kaIntervalDays = 175;
     uint8_t kaAction = 1;
     std::string kaTarget;
@@ -99,13 +111,7 @@ struct IdfConfig {
     int smsHealthHour = 10;
     bool smsHealthNotify = true;
 
-    bool netLedEnabled = true;  // 模组 NET 指示灯(AT+MNETLIGHT)，关闭后重启依然保持
-    bool callNotifyEnabled = true;  // 来电通知：有来电时把主叫号码按短信相同的通道推送
-    bool dataEnabled = false;
-    bool roamingEnabled = true;  // 允许数据漫游(同手机"数据漫游")：关闭后漫游中不激活蜂窝数据
-    std::string apn;
-    std::string operatorPlmn;
-    std::string phoneNumber;
+    IdfModemSlotConfig modems[2];
     IdfSimCredential simCredentials[IDF_MAX_SIM_CREDENTIALS];
 
     IdfPushChannel pushChannels[IDF_MAX_PUSH_CHANNELS];
@@ -136,7 +142,7 @@ esp_err_t idf_config_validate_forward_rules(const std::string& rules, std::strin
 // 转发规则 Perl 风格 \d \w \s 转 POSIX 字符类；保存时校验与运行时匹配共用
 std::string idf_config_translate_perl_classes(const std::string& pattern);
 esp_err_t idf_config_save_forward_rules(const std::string& rules);
-esp_err_t idf_config_save_keepalive(bool enabled, int interval_days, uint8_t action,
+esp_err_t idf_config_save_keepalive(uint8_t slot, bool enabled, int interval_days, uint8_t action,
                                     const std::string& target, const std::string& url,
                                     const std::string& profile);
 esp_err_t idf_config_save_system_schedule(bool reboot_enabled, int reboot_hour,
@@ -144,7 +150,7 @@ esp_err_t idf_config_save_system_schedule(bool reboot_enabled, int reboot_hour,
                                           bool sms_health_enabled, int sms_health_hour,
                                           bool sms_health_notify);
 esp_err_t idf_config_save_sched_tasks(const IdfSchedTask tasks[IDF_MAX_SCHED_TASKS]);
-esp_err_t idf_config_save_sim(bool data_enabled, bool roaming_enabled, const std::string& apn,
+esp_err_t idf_config_save_sim(uint8_t slot, bool data_enabled, bool roaming_enabled, const std::string& apn,
                               const std::string& operator_plmn, const std::string& phone_number,
                               const IdfSimCredential credentials[IDF_MAX_SIM_CREDENTIALS]);
 esp_err_t idf_config_record_sim_unlock_result(const std::string& iccid, bool puk, bool success);
@@ -153,21 +159,19 @@ esp_err_t idf_config_import_text(const std::string& text, int* applied_count);
 esp_err_t idf_config_factory_reset(void);
 esp_err_t idf_config_set_keepalive_last(uint32_t epoch);
 esp_err_t idf_config_set_sched_last(int index, uint32_t epoch);
-esp_err_t idf_config_set_net_led_enabled(bool enabled);
-esp_err_t idf_config_set_call_notify_enabled(bool enabled);
+esp_err_t idf_config_set_net_led_enabled(uint8_t slot, bool enabled);
+esp_err_t idf_config_set_call_notify_enabled(uint8_t slot, bool enabled);
 
 // /status 高频轮询(2s)专用窄快照：只拷贝状态页用到的字段，
 // 避免每次请求做全量配置深拷贝造成持续堆抖动
 struct IdfConfigStatusView {
     int tzOffsetMin = 480;
-    bool dataEnabled = false;
     bool emailEnabled = true;
     bool pushEnabled = true;
     bool emailConfigured = false;
     int pushEnabledCount = 0;
     std::string adminPhone;
-    std::string phoneNumber;
-    std::string apn;
+    IdfModemSlotConfig modems[2];
 };
 
 // 历史 WiFi 的网页视图：只带 SSID 与"密码已设置"标记，密码明文不出配置组件
@@ -212,14 +216,9 @@ struct IdfConfigWebView {
     bool smsHealthEnabled = false;
     int smsHealthHour = 10;
     bool smsHealthNotify = true;
-    bool dataEnabled = false;
-    bool roamingEnabled = true;
-    std::string apn;
-    std::string phoneNumber;
-    std::string operatorPlmn;
+    IdfModemSlotConfig modems[2];
+    uint8_t kaSlot = 0;
     std::string kaProfile;
-    bool netLedEnabled = true;
-    bool callNotifyEnabled = true;
     uint8_t wifiTxPowerQuarterDbm = 34;
     IdfWifiNetworkView wifiNetworks[IDF_MAX_WIFI_NETWORKS];
     IdfSimCredentialView simCredentials[IDF_MAX_SIM_CREDENTIALS];
@@ -228,6 +227,7 @@ struct IdfConfigWebView {
 
 // 保号执行任务专用快照：只带动作所需字段，避免把整份配置拷进后台任务参数
 struct IdfKeepaliveRunView {
+    uint8_t slot = 0;
     bool kaEnabled = false;
     int kaIntervalDays = 175;
     uint8_t kaAction = 1;
@@ -298,6 +298,7 @@ struct IdfEmailSettingsView {
 
 struct IdfSchedulerView {
     bool kaEnabled = false;
+    uint8_t kaSlot = 0;
     int kaIntervalDays = 175;
     uint32_t kaLastTime = 0;
     int tzOffsetMin = 480;
@@ -317,7 +318,7 @@ IdfConfigStatusView idf_config_get_status_view(void);
 IdfConfigWebView idf_config_get_web_view(void);
 IdfKeepaliveRunView idf_config_get_keepalive_run_view(void);
 IdfSchedRunView idf_config_get_sched_run_view(int index);
-IdfSimSettingsView idf_config_get_sim_settings_view(void);
+IdfSimSettingsView idf_config_get_sim_settings_view(uint8_t slot);
 IdfSimUnlockView idf_config_get_sim_unlock_view(const std::string& iccid);
 IdfSmsProcessView idf_config_get_sms_process_view(void);
 IdfPushForwardView idf_config_get_push_forward_view(void);
@@ -329,8 +330,8 @@ bool idf_config_email_configured(void);
 // 锁内直接比对 Web 凭据，避免每个 HTTP 请求做一次全量配置深拷贝
 bool idf_config_check_web_auth(const char* user, const char* pass);
 // 模组初始化只需这一个开关，锁内求值避免在模组任务栈上放全量配置副本
-bool idf_config_net_led_enabled(void);
-bool idf_config_call_notify_enabled(void);
+bool idf_config_net_led_enabled(uint8_t slot);
+bool idf_config_call_notify_enabled(uint8_t slot);
 // 时区/NTP 窄访问器：给运行在小栈任务(tiT/lwip、系统事件)的 SNTP 回调用，
 // 避免深拷贝整个 IdfConfig 到小栈上导致爆栈
 int idf_config_get_tz_offset(void);

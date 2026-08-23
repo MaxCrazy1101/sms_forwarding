@@ -286,7 +286,7 @@ static esp_err_t declare_terminal_capability(std::string& message)
     std::string response;
     // modem 层 API 会把 AT 成功但卡拒绝的 +CSIM 响应作为 ESP_FAIL 返回；
     // 只要存在 +CSIM 数据行，仍交给严格 parser 区分 malformed 与非 9000 SW。
-    esp_err_t err = idf_modem_send_at(TERMINAL_CAPABILITY_CMD, 10000, response);
+    esp_err_t err = idf_modem_send_at(0, TERMINAL_CAPABILITY_CMD, 10000, response);
     bool has_csim_line = response.find("+CSIM:") != std::string::npos;
     if (err != ESP_OK && !has_csim_line) {
         message = "Terminal Capability AT 传输失败: ";
@@ -318,17 +318,17 @@ public:
         cmd += ISDR_AID_HEX;
         cmd += "\"";
         std::string resp;
-        esp_err_t err = idf_modem_send_at(cmd, 30000, resp);
+        esp_err_t err = idf_modem_send_at(0, cmd, 30000, resp);
         if (err != ESP_OK || !parse_ccho_channel(resp, m_channel)) {
             // 上次会话异常退出可能残留逻辑通道，先清理 1..3 再重试一次。
             for (int ch = 1; ch <= 3; ++ch) {
                 char cchc[24];
                 snprintf(cchc, sizeof(cchc), "AT+CCHC=%d", ch);
                 std::string ignored;
-                idf_modem_send_at(cchc, 3000, ignored);
+                idf_modem_send_at(0, cchc, 3000, ignored);
             }
             resp.clear();
-            err = idf_modem_send_at(cmd, 30000, resp);
+            err = idf_modem_send_at(0, cmd, 30000, resp);
         }
         if (err != ESP_OK || !parse_ccho_channel(resp, m_channel)) {
             message = "打开 eUICC 逻辑通道失败";
@@ -353,7 +353,7 @@ public:
             char cchc[24];
             snprintf(cchc, sizeof(cchc), "AT+CCHC=%d", m_channel);
             std::string ignored;
-            idf_modem_send_at(cchc, 5000, ignored);
+            idf_modem_send_at(0, cchc, 5000, ignored);
             m_channel = 0;
             return ESP_FAIL;
         }
@@ -367,7 +367,7 @@ public:
         char cmd[32];
         snprintf(cmd, sizeof(cmd), "AT+CCHC=%d", m_channel);
         std::string ignored;
-        idf_modem_send_at(cmd, 5000, ignored);
+        idf_modem_send_at(0, cmd, 5000, ignored);
         m_open = false;
         m_channel = 0;
     }
@@ -392,7 +392,7 @@ public:
         cmd += hex;
         cmd += "\"";
         std::string resp;
-        esp_err_t err = idf_modem_send_at(cmd, 30000, resp);
+        esp_err_t err = idf_modem_send_at(0, cmd, 30000, resp);
         if (err != ESP_OK) {
             message = "APDU AT 传输失败: ";
             message += esp_err_to_name(err);
@@ -511,8 +511,8 @@ private:
 
 class EsimOperationGuard {
 public:
-    EsimOperationGuard() { idf_modem_begin_esim_operation(); }
-    ~EsimOperationGuard() { idf_modem_end_esim_operation(); }
+    EsimOperationGuard() { idf_modem_begin_esim_operation(0); }
+    ~EsimOperationGuard() { idf_modem_end_esim_operation(0); }
 };
 
 static esp_err_t invoke_es10_raw(const std::vector<uint8_t>& request,
@@ -645,8 +645,10 @@ static bool parse_profile_list_response(const Tlv& response,
 static std::string s_eid_cache;
 static std::atomic<bool> s_eid_cache_stale{false};
 
-static void on_sim_identity_changed()
+static void on_sim_identity_changed(uint8_t slot)
 {
+    // Phase 2 的 eSIM API 仍固定服务 slot 0；slot 1 的实例化在后续阶段接入。
+    if (slot != 0) return;
     s_eid_cache_stale.store(true, std::memory_order_relaxed);
 }
 
@@ -881,7 +883,7 @@ static bool wait_modem_reset_done(uint32_t timeout_ms)
 {
     for (uint32_t waited = 0; waited < timeout_ms; waited += 1000) {
         vTaskDelay(pdMS_TO_TICKS(1000));
-        IdfModemStatus st = idf_modem_get_status();
+        IdfModemStatus st = idf_modem_get_status(0);
         if (st.atReady && st.phase != "powering" && st.phase != "at_ready") return true;
     }
     return false;
@@ -900,7 +902,7 @@ static esp_err_t profile_operation(const std::string& raw, bool enable, std::str
         // 可跨 ESP 重启甚至 OTA 升级存活)。硬重启(断电)彻底清掉卡内会话后重试一次，
         // 免得用户反复点击都停在"卡工具包忙"
         idf_logf("eSIM 操作遇到 catBusy，硬重启模组复位 UICC 后重试");
-        idf_modem_request_reset(true);
+        idf_modem_request_reset(0, true);
         if (!wait_modem_reset_done(90000)) {
             message += "；模组重启超时，请稍后重试";
             return ESP_FAIL;
@@ -910,7 +912,7 @@ static esp_err_t profile_operation(const std::string& raw, bool enable, std::str
     if (err != ESP_OK) return err;
     // 启停结果已写入 eUICC，但当前 UICC 会话仍运行旧 Profile：必须复位 UICC(模组
     // 软重启)才真正生效。这一步就是 issue #17 里用户手动"重启+断电"的自动化。
-    idf_modem_request_reset(false);
+    idf_modem_request_reset(0, false);
     message = enable ? "eSIM Profile 已启用，模组重启附着新卡中"
                      : "eSIM Profile 已禁用，模组重启生效中";
     return ESP_OK;

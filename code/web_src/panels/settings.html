@@ -42,7 +42,8 @@
         <div class="card">
           <div class="card-header">NET 指示灯</div>
           <div class="card-body">
-            <label class="switch-row"><span class="switch-text">启用模组 NET 指示灯</span><input type="checkbox" class="switch-input" name="netLedEnabled" %NETLED_CHECKED% onchange="netLedTemp(this.checked)"><span class="switch-slider"></span></label>
+            <div class="form-group"><label class="form-label">目标卡槽</label><select class="form-select" name="slot" id="netLedSlot" onchange="netLedSlotChange()"><option value="0">卡槽 1</option><option value="1">卡槽 2</option></select></div>
+            <label class="switch-row"><span class="switch-text">启用模组 NET 指示灯</span><input type="checkbox" class="switch-input" name="netLedEnabled" id="netLedEnabled" %NETLED_CHECKED% onchange="netLedTemp(this.checked)"><span class="switch-slider"></span></label>
             <p class="form-hint">拨动开关即时生效（临时下发，不写配置）；点“保存”才永久保存，设备重启 / 模组重新初始化后按保存值恢复</p>
             <button type="submit" class="btn btn-primary btn-block" style="margin-top:4px;">保存指示灯设置</button>
           </div>
