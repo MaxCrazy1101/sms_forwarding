@@ -1449,10 +1449,8 @@ public:
 
     esp_err_t begin(std::string& message)
     {
-        close();
-        pending_size_ = 0;
-        block_number_ = 0;
-        clear_sensitive_bytes(last_response_);
+        if (active_) close();
+        reset_segment_state();
         active_ = true;
         esp_err_t err = session_.begin_segment(slot_, message);
         if (err != ESP_OK) active_ = false;
@@ -1502,24 +1500,33 @@ public:
             return ESP_ERR_INVALID_STATE;
         }
         esp_err_t err = flush(true, message);
-        if (err == ESP_OK) response = std::move(last_response_);
-        close();
+        if (err == ESP_OK) {
+            response = std::move(last_response_);
+            reset_segment_state();
+        } else {
+            close();
+        }
         return err;
     }
 
     void close()
     {
         session_.close();
+        reset_segment_state();
+        clear_sensitive_bytes(last_response_);
+    }
+
+private:
+    void reset_segment_state()
+    {
         active_ = false;
         volatile uint8_t* pending_bytes = pending_.data();
         for (size_t i = 0; i < pending_.size(); ++i) pending_bytes[i] = 0;
         pending_size_ = 0;
         segment_bytes_ = 0;
         block_number_ = 0;
-        clear_sensitive_bytes(last_response_);
     }
 
-private:
     esp_err_t flush(bool last, std::string& message)
     {
         if (pending_size_ == 0 || block_number_ > 0xFFU) {
@@ -2074,6 +2081,8 @@ esp_err_t BppStreamParser::finish(std::string& message)
     if (state_ != State::done || !header_.raw().empty() || outer_remaining_ != 0) {
         return fail("BPP JSON/Base64 结束时 DER 对象不完整", message);
     }
+    // 所有分段结束后统一关通道；分段 finish 本身只清理分段状态。
+    writer_.close();
     return ESP_OK;
 }
 

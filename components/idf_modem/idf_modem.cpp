@@ -1,4 +1,5 @@
 #include "idf_modem.h"
+#include "idf_modem_sampling.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -57,9 +58,22 @@ static constexpr uint32_t CELLULAR_HTTP_TIMEOUT_MS = 90000UL;
 static constexpr uint32_t CELLULAR_PDP_READY_TIMEOUT_MS = 12000UL;
 static constexpr uint32_t MODEM_DATA_MODE_RETRY_GAP_MS = 10000UL;
 static constexpr uint8_t MODEM_DATA_MODE_RETRY_MAX = 3;
-static constexpr uint32_t IDENTITY_RETRY_INTERVAL_MS = 600000UL;
-// 用户显式刷新概览模组信息后才做展示型采样：启动期不主动读取身份/信号；
-// 采样仍受 at_channel_idle 门控，不与收发/保号抢 AT 通道
+// SIM 锁状态与身份字段首次缺失时快速补采，连续无变化后逐步退避；既照顾启动较慢的卡，
+// 也避免不支持 ICCID/COPS/CNUM 等命令的卡长期高频占用 AT 通道。
+static constexpr uint32_t MODEM_RETRY_DELAYS_MS[] = {
+    30000UL, 60000UL, 120000UL, 300000UL, 600000UL,
+};
+static constexpr size_t MODEM_RETRY_DELAY_COUNT =
+    sizeof(MODEM_RETRY_DELAYS_MS) / sizeof(MODEM_RETRY_DELAYS_MS[0]);
+
+static constexpr uint32_t modem_retry_delay_ms(uint8_t level)
+{
+    size_t index = level < MODEM_RETRY_DELAY_COUNT ? level : MODEM_RETRY_DELAY_COUNT - 1;
+    return MODEM_RETRY_DELAYS_MS[index];
+}
+static_assert(modem_retry_delay_ms(0) == 30000UL, "首次补采应在 30 秒后执行");
+static_assert(modem_retry_delay_ms(99) == 600000UL, "补采退避上限应为 10 分钟");
+// 展示采样受 AT 空闲门控；注册后先采一次，缺失身份后台退避重试，手动刷新绕过采样间隔。
 static constexpr uint32_t SIGNAL_INTERVAL_WEB_MS = 10000UL;
 static constexpr uint32_t SIGNAL_DETAIL_INTERVAL_WEB_MS = 30000UL;
 static constexpr uint32_t SIM_CHECK_INTERVAL_MS = 15000UL;  // SIM 热插拔检测轮询间隔
@@ -83,6 +97,7 @@ struct ModemContext {
     // 普通 AT 响应与异步 URC 共用 UART。按行持续提取短信/来电 URC，避免 +CMT 头和
     // 后续 PDU 落在两个读取周期时，PDU 被误吞进下一条 AT 响应。
     std::string uart_line_carry;
+    int64_t uart_line_received_us = 0;
     bool uart_wait_cmt_pdu = false;
     int64_t uart_wait_cmt_until_us = 0;
     bool started = false;
@@ -94,7 +109,7 @@ struct ModemContext {
     bool identity_static_attempted = false;
     bool identity_network_attempted = false;
     std::atomic<int64_t> last_web_poll_us{-WEB_POLL_ACTIVE_WINDOW_US};
-    std::atomic<uint32_t> status_sample_requests{0};
+    IdfModemSampling status_sampling;
     std::atomic<uint32_t> esim_operation_depth{0};
     std::atomic<int> sim_unlock_request{0};  // 1=重查/自动 PIN，2=用户确认后的单次 PUK
     std::string last_pin_attempt_key;
@@ -447,6 +462,9 @@ static IdfModemStatus get_status(ModemContext& ctx)
         copy = ctx.status;
         xSemaphoreGive(ctx.status_mutex);
     }
+    copy.sampleRequested = ctx.status_sampling.requested();
+    copy.sampleCompleted = ctx.status_sampling.completed();
+    copy.sampleRunning = ctx.status_sampling.running();
     return copy;
 }
 
@@ -538,9 +556,14 @@ static void save_identity_cache(ModemContext& ctx, const std::string& imei, cons
     if (err == ESP_OK && changed) MODEM_LOG_LINE(ctx, "模组身份信息已写入缓存");
 }
 
-static void append_urc_text(ModemContext& ctx, const std::string& text)
+static void append_urc_text(ModemContext& ctx, const std::string& raw, int64_t received_us)
 {
-    if (text.empty() || !ctx.urc_mutex) return;
+    if (raw.empty() || !ctx.urc_mutex) return;
+    // 时间元数据与 URC 同锁入队；短信 worker 延迟处理不能把旧消息当成新回复。
+    char stamp[48];
+    snprintf(stamp, sizeof(stamp), "@RXUS:%lld\n", static_cast<long long>(received_us));
+    std::string text = stamp;
+    text += raw;
     if (xSemaphoreTake(ctx.urc_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
     if (text.size() >= URC_BUFFER_MAX) {
         // 长 AT 响应里夹 URC 时，整段转存会突破缓冲上限；保留尾部且尽量从完整行开始。
@@ -570,7 +593,7 @@ static bool looks_like_pdu_line(const std::string& line)
     return std::all_of(line.begin(), line.end(), [](unsigned char ch) { return isxdigit(ch); });
 }
 
-static void preserve_uart_urc_line(ModemContext& ctx, const std::string& raw)
+static void preserve_uart_urc_line(ModemContext& ctx, const std::string& raw, int64_t received_us)
 {
     std::string line = idf_util_trim_copy(raw);
     if (line.empty()) return;
@@ -581,7 +604,7 @@ static void preserve_uart_urc_line(ModemContext& ctx, const std::string& raw)
     bool cmt = line.rfind("+CMT:", 0) == 0;
     bool standalone = line.rfind("+CMTI:", 0) == 0 || line.rfind("+CLIP:", 0) == 0 || line == "RING";
     if (cmt || standalone || (ctx.uart_wait_cmt_pdu && looks_like_pdu_line(line))) {
-        append_urc_text(ctx, line + "\r\n");
+        append_urc_text(ctx, line + "\r\n", received_us);
     }
     if (cmt) {
         ctx.uart_wait_cmt_pdu = true;
@@ -593,12 +616,14 @@ static void preserve_uart_urc_line(ModemContext& ctx, const std::string& raw)
 
 static void preserve_uart_urcs(ModemContext& ctx, const uint8_t* data, size_t len)
 {
+    const int64_t received_us = esp_timer_get_time();
     for (size_t i = 0; i < len; ++i) {
         char ch = static_cast<char>(data[i]);
         if (ch == '\r' || ch == '\n') {
-            if (!ctx.uart_line_carry.empty()) preserve_uart_urc_line(ctx, ctx.uart_line_carry);
+            if (!ctx.uart_line_carry.empty()) preserve_uart_urc_line(ctx, ctx.uart_line_carry, ctx.uart_line_received_us);
             ctx.uart_line_carry.clear();
         } else if (ctx.uart_line_carry.size() < 768) {
+            if (ctx.uart_line_carry.empty()) ctx.uart_line_received_us = received_us;
             ctx.uart_line_carry += ch;
         } else {
             ctx.uart_line_carry.clear();
@@ -752,7 +777,7 @@ static esp_err_t send_at_until(ModemContext& ctx, const std::string& cmd, const 
 }
 
 static esp_err_t send_pdu(ModemContext& ctx, const std::string& cmgs_cmd, const char* pdu,
-                          uint32_t timeout_ms, std::string& response)
+                          uint32_t timeout_ms, std::string& response, void (*on_submit)(uint8_t))
 {
     if (!ctx.started || !pdu) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTakeRecursive(ctx.at_mutex, pdMS_TO_TICKS(timeout_ms + 2000)) != pdTRUE) return ESP_ERR_TIMEOUT;
@@ -797,6 +822,8 @@ static esp_err_t send_pdu(ModemContext& ctx, const std::string& cmgs_cmd, const 
             const uint8_t end = 0x1A;
             uart_write_bytes(ctx.hardware.uart, &end, 1);
         }
+        // 通知调用方实际提交边界，早于 +CMGS 应答，且不把等待提示符算作已发送。
+        if (on_submit) on_submit(ctx.hardware.slot);
         TickDeadline deadline(timeout_ms);
         scan.clear();
         while (!deadline.expired()) {
@@ -840,10 +867,10 @@ esp_err_t idf_modem_send_at_until(uint8_t slot, const std::string& cmd, const ch
 }
 
 esp_err_t idf_modem_send_pdu(uint8_t slot, const std::string& cmgs_cmd, const char* pdu,
-                             uint32_t timeout_ms, std::string& response)
+                             uint32_t timeout_ms, std::string& response, void (*on_submit)(uint8_t))
 {
     ModemContext* ctx = context_for_slot(slot);
-    return ctx ? send_pdu(*ctx, cmgs_cmd, pdu, timeout_ms, response) : ESP_ERR_INVALID_ARG;
+    return ctx ? send_pdu(*ctx, cmgs_cmd, pdu, timeout_ms, response, on_submit) : ESP_ERR_INVALID_ARG;
 }
 
 static bool send_ok(ModemContext& ctx, const char* cmd, uint32_t timeout_ms = 1000,
@@ -880,17 +907,49 @@ static std::string parse_iccid_response(const std::string& raw)
     // 部分固件会在 ICCID 前后附加槽位或状态字段，退回提取响应中的连续数字。
     return first_digit_run(raw, 15, 22);
 }
+static std::string parse_iccid_crsm_response(const std::string& raw)
+{
+    size_t marker = raw.find("+CRSM:");
+    if (marker == std::string::npos) return {};
+    long sw1 = 0;
+    long sw2 = 0;
+    if (sscanf(raw.c_str() + marker, "+CRSM: %ld,%ld", &sw1, &sw2) != 2 ||
+        (sw1 != 144 && sw1 != 145) || sw2 != 0) return {};
+    std::string encoded = first_quoted(raw, marker);
+    if (encoded.size() != 20) return {};
+
+    std::string value;
+    value.reserve(encoded.size());
+    for (size_t i = 0; i < encoded.size(); i += 2) {
+        char low = static_cast<char>(toupper(static_cast<unsigned char>(encoded[i + 1])));
+        char high = static_cast<char>(toupper(static_cast<unsigned char>(encoded[i])));
+        if ((!isdigit(static_cast<unsigned char>(low)) && low != 'F') ||
+            (!isdigit(static_cast<unsigned char>(high)) && high != 'F')) return {};
+        value += low;
+        value += high;
+    }
+    if (!value.empty() && value.back() == 'F') value.pop_back();
+    for (char ch : value) if (!isdigit(static_cast<unsigned char>(ch))) return {};
+    return is_iccid_text(value) ? value : std::string();
+}
 
 static std::string query_current_iccid(ModemContext& ctx)
 {
-    const char* commands[] = {"AT+MCCID", "AT+ICCID", "AT+CCID"};
-    std::string resp;
-    for (const char* cmd : commands) {
-        if (!send_ok(ctx, cmd, 1500, &resp)) continue;
-        std::string iccid = parse_iccid_response(resp);
+    static constexpr const char* kCommands[] = {"AT+MCCID", "AT+ICCID", "AT+CCID"};
+    std::string response;
+    for (const char* command : kCommands) {
+        esp_err_t err = send_at(ctx, command, IDF_MODEM_IDENTITY_TIMEOUT_MS, response);
+        std::string iccid = err == ESP_OK ? parse_iccid_response(response) : std::string();
+        MODEM_LOGF(ctx, "ICCID 查询 %s: %s", command,
+                   err != ESP_OK ? esp_err_to_name(err) : (iccid.empty() ? "响应无有效卡号" : "已读取"));
         if (!iccid.empty()) return iccid;
     }
-    return {};
+    // EF_ICCID 可在厂商命令不可用或部分 PIN 锁卡状态下通过标准受限访问读取。
+    esp_err_t err = send_at(ctx, "AT+CRSM=176,12258,0,0,10", IDF_MODEM_IDENTITY_TIMEOUT_MS, response);
+    std::string iccid = err == ESP_OK ? parse_iccid_crsm_response(response) : std::string();
+    MODEM_LOGF(ctx, "ICCID 查询 EF_ICCID: %s",
+               err != ESP_OK ? esp_err_to_name(err) : (iccid.empty() ? "响应无有效卡号" : "已读取"));
+    return iccid;
 }
 
 static std::string query_sim_state(ModemContext& ctx)
@@ -943,7 +1002,11 @@ static bool try_unlock_sim(ModemContext& ctx, bool allow_puk)
     send_ok(ctx, "AT+CMEE=1", 1200);
     std::string state = query_sim_state(ctx);
     if (state == "ready") {
-        set_sim_status(ctx, "ready", false, {});
+        // READY 后补读凭据主键，不能只依赖注册后概览采样。
+        std::string iccid = get_status(ctx).iccid;
+        if (iccid.empty()) iccid = query_current_iccid(ctx);
+        bool matched = !iccid.empty() && idf_config_get_sim_unlock_view(iccid).found;
+        set_sim_status(ctx, "ready", matched, {}, iccid);
         return true;
     }
     if (state != "pin" && state != "puk") {
@@ -1070,6 +1133,19 @@ static std::string parse_cops(const std::string& resp)
     // 自动模式下若未先选名称格式，AT+COPS? 只回 "+COPS: 0"(无引号运营商名)。
     // 此时返回空让上层改用 COPS=3,0 重试，而不是把模式位当运营商缓存下来。
     return first_quoted(line);
+}
+
+static std::string query_operator_from_modem(ModemContext& ctx)
+{
+    std::string response;
+    // 只选择查询返回格式，不切换网络或注册模式；与网页手动查询使用相同等待时间。
+    esp_err_t format_err = send_at(ctx, "AT+COPS=3,0", IDF_MODEM_IDENTITY_TIMEOUT_MS, response);
+    if (format_err != ESP_OK) MODEM_LOGF(ctx, "运营商名称格式设置: %s", esp_err_to_name(format_err));
+    esp_err_t err = send_at(ctx, "AT+COPS?", IDF_MODEM_IDENTITY_TIMEOUT_MS, response);
+    std::string name = err == ESP_OK ? parse_cops(response) : std::string();
+    MODEM_LOGF(ctx, "运营商查询 AT+COPS?: %s",
+             err != ESP_OK ? esp_err_to_name(err) : (name.empty() ? "响应无运营商名称" : "已读取"));
+    return name;
 }
 
 static std::string parse_apn(const std::string& resp)
@@ -1384,7 +1460,7 @@ static void append_sms_urc_line(ModemContext& ctx, const std::string& line)
 {
     std::string text = line;
     text += "\r\n";
-    append_urc_text(ctx, text);
+    append_urc_text(ctx, text, esp_timer_get_time());
 }
 
 static bool wait_mhttp_download_locked(ModemContext& ctx, int http_id, uint32_t timeout_ms,
@@ -1965,12 +2041,7 @@ static bool sample_identity_once(ModemContext& ctx, bool log_summary = false,
     }
 
     if (before.iccid.size() < 15) {
-        const char* iccid_cmds[] = {"AT+MCCID", "AT+ICCID", "AT+CCID"};
-        for (const char* cmd : iccid_cmds) {
-            if (!patch.iccid.empty()) break;
-            if (send_ok(ctx, cmd, 1500, &resp)) patch.iccid = parse_iccid_response(resp);
-            vTaskDelay(pdMS_TO_TICKS(80));
-        }
+        patch.iccid = query_current_iccid(ctx);
         vTaskDelay(pdMS_TO_TICKS(150));
     }
 
@@ -1987,9 +2058,7 @@ static bool sample_identity_once(ModemContext& ctx, bool log_summary = false,
                         (!ctx.identity_network_attempted || before.operatorName.empty());
     if (need_network) {
         if (before.operatorName.empty()) {
-            // 先选长名称格式：自动模式下不设格式时 COPS? 只回模式位(+COPS: 0)，读不到运营商名
-            send_ok(ctx, "AT+COPS=3,0", 1500, &resp);
-            if (send_ok(ctx, "AT+COPS?", 1500, &resp)) patch.operatorName = parse_cops(resp);
+            patch.operatorName = query_operator_from_modem(ctx);
             vTaskDelay(pdMS_TO_TICKS(150));
         }
         if (before.apnSim.empty()) {
@@ -2029,6 +2098,11 @@ static bool sample_identity_once(ModemContext& ctx, bool log_summary = false,
                    after.imei.empty() ? "-" : after.imei.c_str(),
                    after.iccid.empty() ? "-" : after.iccid.c_str(),
                    after.imsi.empty() ? "-" : after.imsi.c_str());
+    }
+    if (log_summary) {
+        MODEM_LOGF(ctx, "模组信息采样完成：ICCID %s，运营商 %s；缺失字段将后台重试",
+                   after.iccid.empty() ? "缺失" : "已读取",
+                   after.operatorName.empty() ? "缺失" : "已读取");
     }
     save_identity_cache(ctx, patch.imei, patch.iccid);
     return changed;
@@ -2414,6 +2488,8 @@ static void modem_task(void* arg)
     MODEM_LOG_LINE(ctx, "模组 AT 已就绪");
 
     bool sim_ready = initialize_sim_stack(ctx, false);
+    TickType_t last_sim_unlock_check = xTaskGetTickCount();
+    uint8_t sim_unlock_retry_level = 0;
 
     int check_count = 0;
     int stat = -1;
@@ -2431,8 +2507,10 @@ static void modem_task(void* arg)
     }
     bool registered = (stat == 1 || stat == 5);
     bool post_register_done = false;
+    TickType_t last_identity = 0;
+    uint8_t identity_retry_level = 0;
     if (!sim_ready) {
-        // 锁卡/无卡状态由 try_unlock_sim 写入，等待热插拔或网页更新凭据。
+        // 锁卡/无卡状态由 try_unlock_sim 写入，后台按退避间隔重查。
     } else if (!registered) {
         set_phase(ctx, "failed");
     } else {
@@ -2445,12 +2523,12 @@ static void modem_task(void* arg)
         sample_signal_once(ctx);
         sample_signal_detail_once(ctx);
         sample_identity_once(ctx, false, true);
+        last_identity = xTaskGetTickCount();
         post_register_done = startup_sampling_done(ctx);
         set_phase(ctx, post_register_done ? "ready" : "sampling");
     }
 
     TickType_t last_signal = 0;
-    TickType_t last_identity = 0;
     TickType_t last_detail = 0;
     TickType_t last_health = 0;
     TickType_t last_cell_ip = 0;
@@ -2479,40 +2557,67 @@ static void modem_task(void* arg)
             dereg_count = 0;
             last_health = 0;
             last_cell_ip = 0;
+            last_identity = 0;
+            identity_retry_level = 0;
+            last_sim_unlock_check = now;
+            sim_unlock_retry_level = 0;
             last_sim_check = now;  // 给 SIM 上电初始化留出一个完整检测周期
             sim_check_not_before_us = esp_timer_get_time() + 30LL * 1000LL * 1000LL;
             sim_present = -1;
             sms_reconfigure_pending = true;
         }
         int unlock_request = ctx.sim_unlock_request.exchange(0, std::memory_order_relaxed);
+        bool sim_unlock_checked = false;
         if (unlock_request != 0) {
             if (!at_channel_idle_now(ctx)) {
                 ctx.sim_unlock_request.store(unlock_request, std::memory_order_relaxed);
             } else {
                 if (unlock_request == 1) ctx.last_pin_attempt_key.clear();
                 sim_ready = initialize_sim_stack(ctx, unlock_request == 2);
-            }
-            if (sim_ready && at_channel_idle_now(ctx)) {
-                registered = false;
-                post_register_done = false;
-                sms_reconfigure_pending = true;
-                last_health = 0;
+                sim_unlock_checked = true;
+                last_sim_unlock_check = now;
+                sim_unlock_retry_level = 0;
             }
         }
-        if (!sim_ready) ctx.status_sample_requests.store(0, std::memory_order_relaxed);
+        bool sim_unlock_retry_due = !sim_ready &&
+                                    now - last_sim_unlock_check >= pdMS_TO_TICKS(
+                                        modem_retry_delay_ms(sim_unlock_retry_level));
+        if (!sim_unlock_checked && sim_unlock_retry_due && at_channel_idle_now(ctx)) {
+            // 所有恢复共用初始化顺序；后台重试永远不提交 PUK。
+            sim_ready = initialize_sim_stack(ctx, false);
+            sim_unlock_checked = true;
+            last_sim_unlock_check = now;
+            if (sim_ready) sim_unlock_retry_level = 0;
+            else if (sim_unlock_retry_level + 1 < MODEM_RETRY_DELAY_COUNT) ++sim_unlock_retry_level;
+        }
+        if (sim_unlock_checked && sim_ready) {
+            registered = false;
+            post_register_done = false;
+            last_identity = 0;
+            identity_retry_level = 0;
+            sms_reconfigure_pending = true;
+            last_health = 0;
+        }
         if (process_data_mode_retry(ctx)) {
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
         // 用户手动刷新会绕过常规间隔并尽快跑一轮；若 AT 正忙，请求保留到下轮空闲时执行。
-        bool force_sample = ctx.status_sample_requests.load(std::memory_order_relaxed) > 0;
+        bool force_sample = ctx.status_sampling.pending();
         bool web_active = force_sample ||
                           (esp_timer_get_time() -
                            ctx.last_web_poll_us.load(std::memory_order_relaxed)) < WEB_POLL_ACTIVE_WINDOW_US;
         bool startup_sampling = registered && !post_register_done;
-        if (sim_ready && (web_active || startup_sampling) && at_channel_idle_now(ctx)) {
+        bool identity_retry_due = !startup_info_complete(ctx) &&
+                                  (last_identity == 0 || now - last_identity >= pdMS_TO_TICKS(
+                                      modem_retry_delay_ms(identity_retry_level)));
+        // 未就绪 SIM 的手动刷新只采样，不触发密码提交；AT 忙时保留请求代次。
+        bool can_sample = sim_ready || (force_sample && get_runtime_status(ctx).atReady);
+        if (can_sample && (web_active || startup_sampling || identity_retry_due) && at_channel_idle_now(ctx)) {
+            uint32_t sample_request = 0;
             if (force_sample) {
-                ctx.status_sample_requests.store(0, std::memory_order_relaxed);
+                sample_request = ctx.status_sampling.begin();
+                MODEM_LOG_LINE(ctx, "模组信息刷新开始");
             }
             bool data_enabled = false;
             idf_config_get_cellular_settings(ctx.hardware.slot, data_enabled, nullptr);
@@ -2532,16 +2637,17 @@ static void modem_task(void* arg)
                 sample_signal_detail_once(ctx);
                 last_detail = now;
             }
-            if ((startup_sampling || force_sample || !startup_info_complete(ctx)) &&
-                (startup_sampling || force_sample || last_identity == 0 ||
-                 now - last_identity > pdMS_TO_TICKS(IDENTITY_RETRY_INTERVAL_MS))) {
-                sample_identity_once(ctx, false, true);
+            if (startup_sampling || force_sample || identity_retry_due) {
+                bool identity_changed = sample_identity_once(ctx, force_sample, sim_ready);
                 last_identity = now;
+                if (startup_info_complete(ctx) || identity_changed) identity_retry_level = 0;
+                else if (identity_retry_level + 1 < MODEM_RETRY_DELAY_COUNT) ++identity_retry_level;
             }
             if (startup_sampling && startup_sampling_done(ctx)) {
                 set_phase(ctx, "ready");
                 post_register_done = true;
             }
+            if (force_sample) ctx.status_sampling.finish(sample_request);
         }
         // 正常态按 60s 健康探测；未注册但并非已确认无卡时缩短到 5s，
         // 让热插拔/自动重启后的注册恢复不必最多再等一分钟。
@@ -2585,6 +2691,8 @@ static void modem_task(void* arg)
                         sample_signal_once(ctx);
                         sample_signal_detail_once(ctx);
                         sample_identity_once(ctx, false, true);
+                        last_identity = now;
+                        identity_retry_level = 0;
                         post_register_done = startup_sampling_done(ctx);
                         set_phase(ctx, post_register_done ? "ready" : "sampling");
                     }
@@ -2663,8 +2771,8 @@ static void modem_task(void* arg)
         for (int i = 0; i < 10; ++i) {
             // 采样请求只有 AT 空闲时才会被外层消费；通道被长任务(保号下载/eSIM)
             // 占用期间若无条件 break，外层 while 会变成无延时热自旋，饿死 idle 任务
-            if (ctx.status_sample_requests.load(std::memory_order_relaxed) > 0 &&
-                at_channel_idle_now(ctx)) break;
+            if (ctx.status_sampling.pending() &&
+                get_runtime_status(ctx).atReady && at_channel_idle_now(ctx)) break;
             // 事件驱动等待：UART 一有数据(URC/短信直推)立刻醒来抓取；
             // 无事件时 500ms 超时兜底轮询，节奏与原轮询一致
             uart_event_t evt;
@@ -2682,8 +2790,8 @@ static void modem_task(void* arg)
             if (!poll_unsolicited_uart(ctx, 20)) vTaskDelay(pdMS_TO_TICKS(100));
             // 重启请求/AT恢复补初始化尽快响应，不等满 5s 轮询窗
             if (ctx.reset_request.load(std::memory_order_relaxed) != 0) break;
-            if (ctx.status_sample_requests.load(std::memory_order_relaxed) > 0 &&
-                at_channel_idle_now(ctx)) break;
+            if (ctx.status_sampling.pending() &&
+                get_runtime_status(ctx).atReady && at_channel_idle_now(ctx)) break;
         }
     }
 }
@@ -2853,7 +2961,9 @@ void idf_modem_request_status_sample(uint8_t slot)
     ModemContext* ctx = context_for_slot(slot);
     if (!ctx) return;
     ctx->last_web_poll_us.store(esp_timer_get_time(), std::memory_order_relaxed);
-    ctx->status_sample_requests.fetch_add(1, std::memory_order_relaxed);
+    bool already_pending = ctx->status_sampling.pending();
+    ctx->status_sampling.request();
+    if (!already_pending) MODEM_LOG_LINE(*ctx, "模组信息刷新已排队，等待 AT 通道就绪且空闲");
 }
 
 void idf_modem_begin_esim_operation(uint8_t slot)

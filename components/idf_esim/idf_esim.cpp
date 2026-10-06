@@ -1073,6 +1073,7 @@ static esp_err_t read_lpa_auth_material(uint8_t slot,
 }
 
 struct IdfEsimLpaBppSessionImpl {
+    uint8_t slot = 0;
     std::unique_ptr<EsimOperationGuard> guard;
     std::unique_ptr<EsimApduSession> session;
 };
@@ -1268,12 +1269,19 @@ IdfEsimLpaBppSession::~IdfEsimLpaBppSession()
 esp_err_t IdfEsimLpaBppSession::begin_segment(uint8_t slot, std::string& safe_message)
 {
     if (!idf_modem_slot_valid(slot)) return ESP_ERR_INVALID_ARG;
-    close();
+    // 单次下载复用同一槽的逻辑通道，跨槽复用必须显式失败。
+    auto* current = static_cast<IdfEsimLpaBppSessionImpl*>(impl_);
+    if (current) {
+        if (current->slot == slot) return ESP_OK;
+        safe_message = "BPP segment 会话卡槽不一致";
+        return ESP_ERR_INVALID_ARG;
+    }
     auto* impl = new (std::nothrow) IdfEsimLpaBppSessionImpl();
     if (!impl) {
         safe_message = "BPP segment 会话内存不足";
         return ESP_ERR_NO_MEM;
     }
+    impl->slot = slot;
     impl->guard.reset(new (std::nothrow) EsimOperationGuard(slot));
     impl->session.reset(new (std::nothrow) EsimApduSession(slot, true));
     if (!impl->guard || !impl->session) {

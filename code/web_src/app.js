@@ -1126,17 +1126,36 @@
           '</div>' +
           '<div class="form-row">' +
             '<div class="form-group"><label>目标卡槽</label><select name="st' + i + 'Slot" id="st' + i + 'Slot" onchange="stProfileSlotChange(' + i + ')"><option value="0">卡槽 1</option><option value="1">卡槽 2</option></select></div>' +
-            '<div class="form-group"><label>动作</label><select name="st' + i + 'Act" id="st' + i + 'Act"><option value="0">推送自定义提醒</option><option value="1">蜂窝 HTTP 下载(ping)</option><option value="2">发送短信</option><option value="3">USSD 查询</option></select></div>' +
+            '<div class="form-group"><label>动作</label><select name="st' + i + 'Act" id="st' + i + 'Act" onchange="stSyncAction(' + i + ')"><option value="0">推送自定义提醒</option><option value="1">蜂窝 HTTP 下载(ping)</option><option value="2">发送短信</option><option value="3">USSD 查询</option></select></div>' +
           '</div>' +
           '<div class="form-row">' +
             '<div class="form-group"><label>目标 eSIM Profile</label><input type="hidden" name="st' + i + 'Prof" id="st' + i + 'Prof"><select id="st' + i + 'ProfSel" onchange="profSelChange(&quot;st' + i + 'Prof&quot;)"></select><input type="text" id="st' + i + 'ProfCustom" maxlength="64" placeholder="手动输入 ICCID/别名" style="display:none;margin-top:8px;" oninput="profSelChange(&quot;st' + i + 'Prof&quot;)"></div>' +
           '</div>' +
           '<div class="form-group"><label>目标（URL / 号码 / USSD 码；HTTP 留空用保号 URL）</label><input type="text" name="st' + i + 'Tgt" id="st' + i + 'Tgt" maxlength="128"></div>' +
           '<div class="form-group"><label>内容（推送 / 短信正文）</label><input type="text" name="st' + i + 'Pay" id="st' + i + 'Pay" maxlength="128" placeholder="如：记得给副卡充值"></div>' +
+          '<div class="form-group"><label>到期日发送时刻（设备本地时间，可留空沿用间隔时长）</label><input type="time" name="st' + i + 'Time" id="st' + i + 'Time"></div>' +
+          '<div id="st' + i + 'Health">' +
+            '<label><input type="checkbox" name="st' + i + 'Sys" id="st' + i + 'Sys"> 检测系统短信组件状态</label><br>' +
+            '<label><input type="checkbox" name="st' + i + 'Reply" id="st' + i + 'Reply"> 检测短信收发功能（等待匹配回复）</label>' +
+            '<div class="form-row"><div class="form-group"><label>发件人正则</label><input name="st' + i + 'Sender" id="st' + i + 'Sender" maxlength="128" placeholder="如 ^10086$"></div>' +
+            '<div class="form-group"><label>正文正则</label><input name="st' + i + 'Body" id="st' + i + 'Body" maxlength="128" placeholder="如 余额为.*元"></div></div>' +
+            '<div class="form-group"><label>回复超时（秒，5–3600）</label><input type="number" name="st' + i + 'Timeout" id="st' + i + 'Timeout" min="5" max="3600" value="300"></div>' +
+            '<p class="hint">两个正则至少填写一个，任意一个匹配即成功（POSIX 扩展语法）。等待期间保持当前卡，结束后再切回；短信仍正常转发。首次启用只建立基准日。</p>' +
+          '</div>' +
           '<div class="st-task-foot"><label><input type="checkbox" name="st' + i + 'Back" id="st' + i + 'Back" checked> 完成后切回原卡</label>' +
           '<span class="btn-row"><button type="button" class="btn btn-secondary btn-sm" onclick="stRun(' + i + ')">立即执行</button><button type="button" class="btn btn-secondary btn-sm" onclick="stResetBase(' + i + ')">基准日=今天</button><button type="button" class="btn btn-danger btn-sm" onclick="stRemove(' + i + ')">删除任务</button></span></div>' +
         '</div>';
       return card;
+    }
+    function stSyncAction(i) {
+      var action = document.getElementById('st' + i + 'Act');
+      var wrap = document.getElementById('st' + i + 'Health');
+      if (!wrap || !action) return;
+      var sms = action.value === '2';
+      wrap.style.display = sms ? '' : 'none';
+      if (!sms) ['Sys', 'Reply'].forEach(function(sfx) {
+        var el = document.getElementById('st' + i + sfx); if (el) el.checked = false;
+      });
     }
     function stBuildCards() {
       var wrap = document.getElementById('stTasks');
@@ -1162,13 +1181,14 @@
           profInit('st' + i + 'Prof', '', selectedSlot('st' + i + 'Slot') || 0);
           stShow(i, true);
           stSyncHead(i);
+          stSyncAction(i);
           return;
         }
       }
     }
     function stRemove(i) {
       if (!confirm('删除任务 ' + (i + 1) + '？点击“保存自定义任务”后生效。')) return;
-      ['Name', 'Tgt', 'Pay', 'Prof', 'ProfCustom'].forEach(function(sfx){ var el = document.getElementById('st' + i + sfx); if (el) el.value = ''; });
+      ['Name', 'Tgt', 'Pay', 'Prof', 'ProfCustom', 'Time', 'Sender', 'Body'].forEach(function(sfx){ var el = document.getElementById('st' + i + sfx); if (el) el.value = ''; });
       var el = document.getElementById('st' + i + 'Days'); if (el) el.value = 30;
       el = document.getElementById('st' + i + 'Slot'); if (el) el.value = 0;
       el = document.getElementById('st' + i + 'Act'); if (el) el.value = 0;
@@ -1176,6 +1196,8 @@
       el = document.getElementById('st' + i + 'Back'); if (el) el.checked = true;
       el = document.getElementById('st' + i + 'ProfSel'); if (el) el.value = '';
       el = document.getElementById('st' + i + 'ProfCustom'); if (el) el.style.display = 'none';
+      ['Sys', 'Reply'].forEach(function(sfx) { var box = document.getElementById('st' + i + sfx); if (box) box.checked = false; });
+      stSetVal('st' + i + 'Timeout', 300);
       stShow(i, false);
     }
     function stSyncHead(i) {
@@ -1210,6 +1232,13 @@
             stSetVal('st' + i + 'Name', t.name); stSetVal('st' + i + 'Days', t.intervalDays);
             stSetVal('st' + i + 'Slot', t.slot);
             stSetVal('st' + i + 'Act', t.action);
+            var minute = Number(t.startMinute == null ? -1 : t.startMinute);
+            stSetVal('st' + i + 'Time', minute < 0 ? '' : ('0' + Math.floor(minute / 60)).slice(-2) + ':' + ('0' + (minute % 60)).slice(-2));
+            el = document.getElementById('st' + i + 'Sys'); if (el) el.checked = !!t.checkSystem;
+            el = document.getElementById('st' + i + 'Reply'); if (el) el.checked = !!t.checkReply;
+            stSetVal('st' + i + 'Sender', t.replySender); stSetVal('st' + i + 'Body', t.replyBody);
+            stSetVal('st' + i + 'Timeout', t.replyTimeoutSec == null ? 300 : t.replyTimeoutSec);
+            stSyncAction(i);
             stSetVal('st' + i + 'Tgt', t.target); stSetVal('st' + i + 'Pay', t.payload);
             profInit('st' + i + 'Prof', t.profile || '', Number(t.slot));
             stShow(i, stCardUsed(t));
@@ -1221,7 +1250,7 @@
             else if (!d.timeValid) cd.textContent = '时间未同步';
             else if (t.daysLeft < 0) cd.textContent = '待建立基准日';
             else if (t.daysLeft === 0) cd.textContent = '已到期，等待执行';
-            else cd.textContent = '上次 ' + (t.lastLocal || '--').slice(0, 10) + ' · 约 ' + t.daysLeft + ' 天后';
+            else cd.textContent = t.nextLocal ? ('下次 ' + t.nextLocal) : ('约 ' + t.daysLeft + ' 天后');
           }
         }
         if (!polling) stArmForm();
@@ -1366,7 +1395,7 @@
         var cell = m.dataEnabled ? (m.cellIp || '获取中') : '— (未启用)';
         var op = m.operator || (m.modemInitPhase === 'sampling' ? '读取中' : (m.modemReady ? '未刷新' : modemPhaseText(m)));
         html += '<div class="card"><div class="card-header">卡槽 ' + (slot + 1) +
-          '<button type="button" class="btn btn-secondary btn-sm" style="margin-left:auto;" onclick="refreshModemInfo(' + slot + ',this)">刷新模组信息</button></div><div class="card-body"><table class="info-table">' +
+          '<button type="button" class="btn btn-secondary btn-sm" style="margin-left:auto;" id="modemRefreshButton' + slot + '" onclick="refreshModemInfo(' + slot + ',this)">刷新模组信息</button></div><div class="card-body"><div id="modemSampleResult' + slot + '" class="help-text" role="status" aria-live="polite"></div><table class="info-table">' +
           '<tr><td>模组状态</td><td>' + htmlEsc(modemPhaseText(m)) + '</td></tr>' +
           '<tr><td>SIM 状态</td><td>' + htmlEsc(simLockText(m)) + '</td></tr>' +
           '<tr><td>运营商 / 注册</td><td>' + htmlEsc(op + ' · CEREG ' + m.ceregStat) + '</td></tr>' +
@@ -1385,8 +1414,46 @@
           '</table></div></div>';
       });
       box.innerHTML = html;
+      modems.forEach(renderModemSampleState);
     }
     var statusTimer = null, statusPolling = false, statusSeq = 0, statusAbort = null, statusLoading = false, statusFailCount = 0, devEpochBase = 0, devEpochBaseMs = 0, latestStatusKey = '', statusFastUntil = 0, modemSampleUntil = [0, 0];
+    var modemSampleAwaitingResponse = [false, false];
+    function modemSampleRequestFailed(slot) {
+      modemSampleAwaitingResponse[slot] = false;
+      var btn = document.getElementById('modemRefreshButton' + slot);
+      if (btn) { btn.disabled = false; btn.textContent = '重试刷新'; }
+      ovSet('modemSampleResult' + slot, '刷新请求未确认，请重试或等待状态恢复');
+    }
+    function renderModemSampleState(d) {
+      var slot = Number(d.slot);
+      if (slot !== 0 && slot !== 1) return;
+      var btn = document.getElementById('modemRefreshButton' + slot);
+      if (modemSampleAwaitingResponse[slot]) {
+        if (btn) { btn.disabled = true; btn.textContent = '提交刷新...'; }
+        ovSet('modemSampleResult' + slot, '正在提交刷新请求');
+        return;
+      }
+      var requested = Number(d.modemSampleRequested || 0);
+      var pending = requested !== Number(d.modemSampleCompleted || 0);
+      var running = !!d.modemSampleRunning;
+      if (btn) {
+        btn.disabled = pending || running;
+        btn.textContent = running ? '采样中...' : (pending ? '等待 AT 通道...' : '刷新模组信息');
+      }
+      var message = '';
+      if (pending || running) {
+        message = running ? '正在读取模组信息' : '刷新已排队，等待 AT 通道就绪且空闲';
+        modemSampleUntil[slot] = Date.now() + 15000;
+        statusFastUntil = Date.now() + 15000;
+      } else if (requested) {
+        modemSampleUntil[slot] = 0;
+        var missing = [];
+        if (!d.iccid) missing.push('ICCID');
+        if (!d.operator) missing.push('运营商');
+        message = missing.length ? '采样已完成，' + missing.join('、') + '仍未读到；请查看日志中的查询结果，后台会继续重试' : '模组信息刷新完成';
+      }
+      ovSet('modemSampleResult' + slot, message);
+    }
     function deviceEpochNow() {
       if (!devEpochBase) return 0;
       return devEpochBase + Math.floor((Date.now() - devEpochBaseMs) / 1000);
@@ -1409,6 +1476,7 @@
       var timeoutId = setTimeout(function() {
         if (finished || seq !== statusSeq) return;
         timedOut = true;
+        if (sample) modemSampleRequestFailed(sampleSlot);
         if (ctrl) ctrl.abort();
         else {
           // 无 AbortController 时不能真中断：同步放开 statusLoading 闸门，
@@ -1422,6 +1490,7 @@
       fetch(url, opt).then(jsonOrThrow).then(function(d) {
         if (seq !== statusSeq || timedOut) return;  // 旧响应直接丢弃，只显示最新状态
         statusFailCount = 0;
+        if (sample) modemSampleAwaitingResponse[sampleSlot] = false;
         if (typeof d.tz === 'number') devTz = d.tz;
         if (typeof d.nowEpoch === 'number' && d.nowEpoch > 100000) {
           devEpochBase = d.nowEpoch;
@@ -1478,6 +1547,7 @@
       }).catch(function() {
         if (seq !== statusSeq) return;
         statusFailCount++;
+        if (sample) modemSampleRequestFailed(sampleSlot);
         if (timedOut) { ovSet('ovRefresh', '刷新超时'); return; }
         ovSet('ovRefresh', '刷新失败');
         if (statusFailCount >= 3) {
@@ -1512,18 +1582,16 @@
     }
     function stopStatusPoll() { statusPolling = false; if (statusTimer) { clearTimeout(statusTimer); statusTimer = null; } }
     function refreshModemInfo(slot, btn) {
-      var old = btn ? btn.textContent : '';
-      if (btn) { btn.disabled = true; btn.textContent = '采样中...'; }
-      ovSet('ovRefresh', '正在采样...');
+      if (slot !== 0 && slot !== 1) return;
+      modemSampleAwaitingResponse[slot] = true;
+      if (btn) { btn.disabled = true; btn.textContent = '提交刷新...'; }
+      ovSet('modemSampleResult' + slot, '正在提交刷新请求');
       modemSampleUntil[slot] = Date.now() + 15000;
       statusFastUntil = Date.now() + 15000;
       loadStatus(true, slot);
       [700, 1500, 2500, 4000].forEach(function(delay) {
         setTimeout(function() { if (panelActive('overview')) loadStatus(); }, delay);
       });
-      setTimeout(function() {
-        if (btn) { btn.disabled = false; btn.textContent = old || '刷新模组信息'; }
-      }, 3000);
     }
 
     // ---- SIM / 网络 ----
@@ -2068,9 +2136,7 @@
         box.appendChild(d);
       });
     }
-    // ---- 规则本地测试：镜像固件 eval_forward_rules + 派发门控（自上而下首条命中即止）----
-    // 浏览器用 JS 正则预览，与设备端 POSIX ERE 在个别语法上可能有差异
-    // 按固件派发逻辑折算实际会发出的目标：推送总开关、通道启用、邮件启用+配置齐全
+    // ---- 规则测试：匹配交给固件真实规则引擎，前端只折算当前可投递目标 ----
     function deliverTargets(useEmail, chanMask) {
       var c = webConfig || {}, arr = c.pushChannels || [];
       var out = [], skipped = [];
@@ -2091,38 +2157,40 @@
       serializeRules();
       var from = (document.getElementById('rtFrom').value || '').trim();
       var text = document.getElementById('rtText').value || '';
-      var slot = (document.getElementById('rtSlot').value || '0').trim();
+      var slot = (document.getElementById('rtSlot').value || '').trim();
       var r = document.getElementById('rtResult');
-      for (var i = 0; i < fwdRules.length; i++) {
-        var rule = fwdRules[i];
-        if (!rule.enabled || !rule.pattern) continue;
-        var hit = false;
-        if (rule.type === 'slot') {
-          hit = rule.pattern === slot;
-        } else if (rule.type === 'kw') {
-          hit = text.indexOf(rule.pattern) >= 0;
-        } else {
-          try { hit = new RegExp(rule.pattern, 'i').test(rule.type === 'from' ? from : text); }
-          catch (e) { r.className = 'result-box result-error'; r.textContent = '规则 ' + (i + 1) + ' 的正则浏览器无法解析，请检查语法：' + e.message; return; }
-        }
-        if (!hit) continue;
-        if (rule.drop) {
+      if (slot !== '0' && slot !== '1') { r.className = 'result-box result-error'; r.textContent = '请选择测试卡槽'; return; }
+      r.className = 'result-box result-loading'; r.textContent = '按设备实际规则测试中...';
+      var raw = (document.getElementById('forwardRulesRaw') || {}).value || '';
+      var body = new URLSearchParams();
+      body.append('slot', slot); body.append('rules', raw); body.append('sender', from); body.append('text', text);
+      csrfFetch('/testrule', {method:'POST', cache:'no-store', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:body})
+        .then(jsonOrThrow).then(function(result) {
+        if (!panelActive('push')) return;
+        if (!result.success) throw new Error(result.message || '设备规则测试失败');
+        var index = result.ruleIndex || 0;
+        if (result.matched && result.drop) {
           r.className = 'result-box result-error';
-          r.textContent = '命中规则 ' + (i + 1) + ' → 丢弃(不转发)';
+          r.textContent = '命中规则 ' + index + ' → 丢弃(不转发)';
           return;
         }
-        var d = deliverTargets(rule.email, rule.chans);
-        var msg = '命中规则 ' + (i + 1) + ' → ' + (d.out.length ? '实际转发到：' + d.out.join('、') : '没有可用转发目标(该短信不会被转发)');
+        var selected = {};
+        if (result.matched) {
+          for (var c = 1; c <= 5; c++) selected[c] = !!(result.chMask & (1 << (c - 1)));
+        } else {
+          for (var n = 1; n <= 5; n++) selected[n] = true;
+        }
+        var d = deliverTargets(result.matched ? !!result.email : true, selected);
+        var prefix = result.matched ? ('命中规则 ' + index + ' → ') : '未命中任何规则 → ';
+        var msg = prefix + (d.out.length ? (result.matched ? '实际转发到：' : '按默认策略实际转发到：') + d.out.join('、') : '没有可用转发目标(该短信不会被转发)');
         if (d.skipped.length) msg += '；跳过：' + d.skipped.join('、');
-        r.className = 'result-box ' + (d.out.length ? 'result-success' : 'result-error');
+        r.className = 'result-box ' + (d.out.length ? (result.matched ? 'result-success' : 'result-info') : 'result-error');
         r.textContent = msg;
-        return;
-      }
-      // 未命中：固件默认转发到全部启用通道 + 邮件(各自仍受开关/配置门控)
-      var all = {}; for (var n = 1; n <= 5; n++) all[n] = true;
-      var dd = deliverTargets(true, all);
-      r.className = 'result-box ' + (dd.out.length ? 'result-info' : 'result-error');
-      r.textContent = '未命中任何规则 → ' + (dd.out.length ? '按默认策略实际转发到：' + dd.out.join('、') : '没有可用转发目标(该短信不会被转发)');
+      }).catch(function(e) {
+        if (!panelActive('push')) return;
+        r.className = 'result-box result-error';
+        r.textContent = '规则测试失败：' + (e && e.message ? e.message : '设备未返回有效结果');
+      });
     }
 
     // ---- 短信详情抽屉(点击展开) ----

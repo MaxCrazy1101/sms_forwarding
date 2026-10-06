@@ -39,8 +39,8 @@ esp_err_t idf_esim_lpa_remove_notification(uint8_t slot,
                                            uint32_t sequence_number,
                                            std::string& safe_message);
 
-// 在一个 BPP segment 内按模组允许的 transport block 写入；每个 segment
-// 重新打开最短的 eUICC 会话，避免 HTTPS 等待期间长期占用 AT 通道。
+// 同次 BPP 下载的各 segment 复用同槽逻辑通道；分段只重置 transport block。
+// 整次下载成功、失败或析构时统一关闭会话并解除目标槽 AT 操作保护。
 class IdfEsimLpaBppSession {
 public:
     IdfEsimLpaBppSession();

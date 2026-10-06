@@ -9,7 +9,7 @@
 #include "esp_err.h"
 
 static constexpr int IDF_MAX_PUSH_CHANNELS = 5;
-static constexpr const char* IDF_FW_VERSION = "1.1.5";
+static constexpr const char* IDF_FW_VERSION = "1.2.0";
 static constexpr const char* IDF_DEFAULT_WEB_USER = "admin";
 static constexpr const char* IDF_DEFAULT_WEB_PASS = "admin123";
 static constexpr const char* IDF_KEEPALIVE_DEFAULT_URL = "http://gg.incrafttime.top/api/payload?size=64342";
@@ -53,6 +53,12 @@ struct IdfSchedTask {
     std::string target;      // ping URL / 短信号码 / USSD 码
     std::string payload;     // 推送/短信内容
     int intervalDays = 30;   // 触发周期（天）
+    int startMinute = -1;    // -1=沿用间隔时长；0..1439=到期日当地时分
+    bool checkSystem = false; // 执行前检测系统短信组件
+    bool checkReply = false;  // 发短信后验证收到的回复
+    std::string replySender; // 发件人正则；与正文正则为“或”关系
+    std::string replyBody;   // 正文正则
+    int replyTimeoutSec = 300;
     uint32_t lastRun = 0;    // 基准时间（epoch），0=未建立
     uint8_t slot = 0;
     uint8_t action = 0;      // 0=推送提醒 1=蜂窝HTTP ping 2=发短信 3=USSD
@@ -149,6 +155,7 @@ esp_err_t idf_config_save_system_schedule(bool reboot_enabled, int reboot_hour,
                                           bool hb_enabled, int hb_hour,
                                           bool sms_health_enabled, int sms_health_hour,
                                           bool sms_health_notify);
+bool idf_config_validate_sched_task(const IdfSchedTask& task, std::string* message = nullptr);
 esp_err_t idf_config_save_sched_tasks(const IdfSchedTask tasks[IDF_MAX_SCHED_TASKS]);
 esp_err_t idf_config_save_sim(uint8_t slot, bool data_enabled, bool roaming_enabled, const std::string& apn,
                               const std::string& operator_plmn, const std::string& phone_number,
@@ -304,7 +311,15 @@ struct IdfEmailSettingsView {
     std::string smtpSendTo;
 };
 
-// 5 秒调度循环只需系统级开关；自定义任务详情按小时逐项读取。
+// 周期轮询只读标量时序，避免每 5 秒深拷贝任务正文和回复正则。
+struct IdfSchedTimingView {
+    bool enabled = false;
+    int intervalDays = 30;
+    int startMinute = -1;
+    uint32_t lastRun = 0;
+};
+
+// 5 秒调度循环只需系统级开关；自定义任务详情按需逐项读取。
 struct IdfSchedulerCoreView {
     bool kaEnabled = false;
     uint8_t kaSlot = 0;
@@ -319,6 +334,7 @@ struct IdfSchedulerCoreView {
     int smsHealthHour = 10;
     bool smsHealthNotify = true;
     bool emailEnabled = true;
+    IdfSchedTimingView schedTasks[IDF_MAX_SCHED_TASKS];
 };
 
 struct IdfSchedulerView {
